@@ -1,0 +1,52 @@
+# ==========================================
+# 1. MÔI TRƯỜNG PYTHON & HỆ ĐIỀU HÀNH
+# ==========================================
+__pycache__/
+*.py[cod]
+*$py.class
+.env
+venv/
+env/
+.DS_Store
+Thumbs.db
+
+# ==========================================
+# 2. DỮ LIỆU (DATASETS) - Tuyệt đối không push
+# ==========================================
+data/
+datasets/
+Pix2Gestalt/
+COCOA/
+*.zip
+*.tar.gz
+*.csv
+*.json
+
+# ==========================================
+# 3. TRỌNG SỐ MÔ HÌNH (WEIGHTS & CHECKPOINTS)
+# ==========================================
+checkpoints/
+models/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+
+# ==========================================
+# 4. LOGS & KẾT QUẢ ĐẦU RA (OUTPUTS)
+# ==========================================
+logs/
+wandb/
+runs/
+output_img/
+vis/
+*.png
+*.jpg
+*.jpeg
+
+# ==========================================
+# 5. IDE & EDITOR CỦA BẠN
+# ==========================================
+.idea/
+.vscode/
+*.swp
