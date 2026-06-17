@@ -1,4 +1,4 @@
-import torch
+\import torch
 from torch.utils.data import Dataset
 import cv2
 import numpy as np
@@ -31,10 +31,21 @@ class AmodalDataset(Dataset):
             print(f"📁 Đã load {self.num_samples} mẫu từ tập COCOA.")
             
         elif self.mode == "pix2gestalt":
-            # Logic quét thư mục của Pix2Gestalt
-            # (Bạn sẽ điền logic tương ứng khi tải xong 120GB)
-            self.num_samples = 0 
-            print("⏳ Chế độ Pix2Gestalt đã sẵn sàng, chờ mount dữ liệu 120GB.")
+            print("⏳ Khởi tạo chế độ Pix2Gestalt, đang quét dữ liệu...")
+            # Khai báo các đường dẫn thư mục con dựa theo cấu trúc của pix2gestalt
+            self.occlusion_dir = os.path.join(data_dir, 'occlusion')
+            self.visible_mask_dir = os.path.join(data_dir, 'visible_object_mask')
+            self.whole_mask_dir = os.path.join(data_dir, 'whole_mask')
+            
+            # Lấy danh sách tên file hợp lệ (kiểm tra thư mục occlusion làm chuẩn)
+            valid_exts = ('.jpg', '.jpeg', '.png', '.bmp', '.tif')
+            self.image_names = sorted([
+                f for f in os.listdir(self.occlusion_dir) 
+                if f.lower().endswith(valid_exts)
+            ])
+            
+            self.num_samples = len(self.image_names)
+            print(f"✅ Đã tìm thấy {self.num_samples} mẫu dữ liệu Pix2Gestalt.")
 
     def __len__(self):
         return self.num_samples
@@ -60,7 +71,7 @@ class AmodalDataset(Dataset):
         modal_mask = amodal_mask.copy()
         modal_mask[occluder == 1] = 0
         
-        # 5. Đổ màu cho Ảnh RGB để hiển thị (Hình tròn màu Xanh lá, Hình vuông che màu Đỏ)
+        # 5. Đổ màu cho Ảnh RGB để hiển thị
         image[amodal_mask == 1] = [0, 255, 0] # Vật thể chính
         image[occluder == 1] = [255, 0, 0]    # Vật che khuất
         
@@ -81,13 +92,45 @@ class AmodalDataset(Dataset):
             return self._generate_toy_data()
             
         elif self.mode == "cocoa":
-            # Ở đây bạn sẽ viết lệnh cv2.imread để đọc thật từ ổ cứng
-            # Hiện tại cứ dùng hàm toy để tránh lỗi khi chưa có thư mục thật
+            # TODO: Xử lý COCOA
             pass
             
         elif self.mode == "pix2gestalt":
-            # Logic đọc file 120GB
-            pass
+            img_name = self.image_names[idx]
+            
+            # Khởi tạo đường dẫn cụ thể của từng file
+            img_path = os.path.join(self.occlusion_dir, img_name)
+            m_v_path = os.path.join(self.visible_mask_dir, img_name)
+            m_a_path = os.path.join(self.whole_mask_dir, img_name)
+            
+            # Đọc ảnh RGB chứa vật bị che (Occlusion Image)
+            img = cv2.imread(img_path)
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB) # Chuyển từ BGR (OpenCV) sang RGB
+            
+            # Đọc Mask (Đọc dưới dạng Grayscale)
+            # Dùng cv2.IMREAD_UNCHANGED (-1) giống file simple.py của tác giả
+            m_v = cv2.imread(m_v_path, cv2.IMREAD_UNCHANGED)
+            m_a = cv2.imread(m_a_path, cv2.IMREAD_UNCHANGED)
+            
+            # Resize ảnh và mask về kích thước chuẩn (ví dụ 256x256)
+            # Lưu ý: Mask dùng INTER_NEAREST để không làm nhòe các giá trị nhị phân (0, 1)
+            img = cv2.resize(img, self.image_size, interpolation=cv2.INTER_LINEAR)
+            m_v = cv2.resize(m_v, self.image_size, interpolation=cv2.INTER_NEAREST)
+            m_a = cv2.resize(m_a, self.image_size, interpolation=cv2.INTER_NEAREST)
+            
+            # Chuẩn hóa về [0, 1]
+            img = img.astype(np.float32) / 255.0
+            
+            # Mask của Pix2Gestalt thường có giá trị 0-255, ta quy về nhị phân 0-1
+            m_v = (m_v > 127).astype(np.float32)
+            m_a = (m_a > 127).astype(np.float32)
+            
+            # Chuyển Data Layout cho PyTorch
+            img = np.transpose(img, (2, 0, 1))           # (H, W, C) -> (C, H, W)
+            m_v = np.expand_dims(m_v, axis=0)            # (H, W) -> (1, H, W)
+            m_a = np.expand_dims(m_a, axis=0)            # (H, W) -> (1, H, W)
+            
+            return torch.tensor(img), torch.tensor(m_v), torch.tensor(m_a)
 
 # Khối Test nhanh
 if __name__ == "__main__":
