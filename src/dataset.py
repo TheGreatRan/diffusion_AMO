@@ -1,4 +1,4 @@
-\import torch
+import torch
 from torch.utils.data import Dataset
 import cv2
 import numpy as np
