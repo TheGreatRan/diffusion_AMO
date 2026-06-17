@@ -17,7 +17,7 @@ from src.models.denoising_net import DenoisingNetwork, WeightedBCELoss
 # ==========================================
 # Lấy từ file cấu hình của bạn, hoặc cấu hình cứng ở đây cho dễ chạy Kaggle
 BATCH_SIZE = 8
-NUM_EPOCHS = 100
+NUM_EPOCHS = 10
 LEARNING_RATE = 1e-4
 IMAGE_SIZE = (256, 256)
 TIMESTEPS = 1000
