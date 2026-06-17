@@ -88,8 +88,8 @@ class AmodalDataset(Dataset):
             m_a_path = os.path.join(self.whole_mask_dir, f"{base_id}_whole_mask.png")
             
             img = cv2.imread(img_path)
-            m_v = cv2.imread(m_v_path)
-            m_a = cv2.imread(m_a_path)
+            m_v = cv2.imread(m_v_path, cv2.IMREAD_GRAYSCALE)
+            m_a = cv2.imread(m_a_path, cv2.IMREAD_GRAYSCALE)
             
             # Chốt chặn cuối cùng (Đề phòng file có tồn tại nhưng bị hỏng nội dung)
             if img is None or m_v is None or m_a is None:
