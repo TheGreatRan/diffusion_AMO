@@ -56,17 +56,20 @@ class AmodalDataset(Dataset):
             if not self.coco_img_dir:
                 raise ValueError("LỖI: Chế độ COCOA yêu cầu phải truyền biến 'coco_img_dir'.")
             
+            # --- BỔ SUNG: CHỈ QUẾT Ổ CỨNG 2 LẦN ĐỂ LƯU DANH SÁCH FILE COCO 2017 VÀO RAM ---
+            print("💾 Đang lập chỉ mục ảnh COCO 2017 để tăng tốc xử lý...")
+            self.train2017_set = set(os.listdir(os.path.join(self.coco_img_dir, "train2017")))
+            self.val2017_set = set(os.listdir(os.path.join(self.coco_img_dir, "val2017")))
+            
             with open(self.data_dir, 'r') as f:
                 cocoa_data = json.load(f)
             
-            # Quét từng bức ảnh trong file JSON
+            # Quét từng bức ảnh trong file JSON (Giữ nguyên logic phân tích của bạn)
             for ann in cocoa_data['annotations']:
-                img_filename = ann['url'].split('/')[-1] # Lấy tên ảnh từ URL
+                img_filename = ann['url'].split('/')[-1] 
                 
-                # Giải mã đồ thị che khuất (Depth Constraints)
                 depth_constraints = ann.get('depth_constraint', '')
-                occluders_of = {} # Cấu trúc: {ID_Bị_Che : [Danh sách ID_Che_Khuất]}
-                
+                occluders_of = {} 
                 if depth_constraints:
                     pairs = depth_constraints.split(',')
                     for pair in pairs:
@@ -77,19 +80,14 @@ class AmodalDataset(Dataset):
                                 occluders_of[back] = []
                             occluders_of[back].append(front)
 
-                # Duyệt qua các vùng vật thể (Regions)
                 regions = ann['regions']
                 for region in regions:
-                    # Bỏ qua background/stuff
                     if region.get('isStuff', 0) == 1: 
                         continue
-                        
-                    # Lấy ID chuẩn theo thuộc tính 'order' của tác giả Zhu et al.
                     region_order = region.get('order')
-                    
                     if region_order is not None:
                         self.samples.append({
-                            'img_filename': img_filename,
+                            'img_filename': img_filename, # Vẫn lưu tên gốc 2014 từ JSON phục vụ map ID
                             'region': region,
                             'region_order': region_order,
                             'all_regions': regions,
@@ -97,9 +95,7 @@ class AmodalDataset(Dataset):
                         })
                     
             self.num_samples = len(self.samples)
-            print(f"✅ Đã giải mã thành công {self.num_samples} vật thể từ COCOA.")
-        else:
-            raise ValueError(f"Chế độ mode='{self.mode}' không được hỗ trợ!")
+            print(f"✅ Đã giải mã thành công {self.num_samples} vật thể từ COCOA tương thích COCO 2017.")
 
     def __len__(self):
         return self.num_samples
@@ -182,26 +178,23 @@ class AmodalDataset(Dataset):
             
         elif self.mode.startswith("cocoa"):
             sample = self.samples[idx]
-            img_filename = sample['img_filename']
+            old_filename = sample['img_filename'] # Ví dụ: "COCO_val2014_000000192817.jpg"
             
-            # ==========================================
-            # 1. TẢI ẢNH GỐC VỚI ĐIỀU HƯỚNG THÔNG MINH
-            # ==========================================
-            # Dựa vào tên file (VD: COCO_val2014_000000192817.jpg) để tìm đúng thư mục con
-            if "train2014" in img_filename:
-                img_path = os.path.join(self.coco_img_dir, "train2014", img_filename)
-            elif "val2014" in img_filename:
-                img_path = os.path.join(self.coco_img_dir, "val2014", img_filename)
+            # =========================================================
+            # BƯỚC 1 CHUYỂN ĐỔI: ÉP FORMAT TÊN FILE TỪ 2014 SANG chuẩn 2017
+            # =========================================================
+            # Lấy phần tử cuối sau dấu gạch dưới: "000000192817.jpg"
+            coco2017_filename = old_filename.split('_')[-1] 
+            
+            # Kiểm tra nhanh trên RAM xem file nằm ở thư mục train2017 hay val2017
+            if coco2017_filename in self.train2017_set:
+                img_path = os.path.join(self.coco_img_dir, "train2017", coco2017_filename)
+            elif coco2017_filename in self.val2017_set:
+                img_path = os.path.join(self.coco_img_dir, "val2017", coco2017_filename)
             else:
-                # Fallback phòng hờ trường hợp bạn gom tất cả ảnh vào 1 thư mục phẳng
-                img_path = os.path.join(self.coco_img_dir, img_filename)
+                raise FileNotFoundError(f"🚨 Không tìm thấy ảnh {coco2017_filename} trong cả tập train2017 và val2017 của bộ COCO 2017!")
                 
             img = cv2.imread(img_path)
-            
-            if img is None:
-                raise ValueError(f"🚨 OpenCV không tìm thấy ảnh COCO tại: {img_path}\n"
-                                 f"Hãy kiểm tra lại biến COCO_IMG_DIR xem đã trỏ đúng thư mục gốc chứa 'train2014' và 'val2014' chưa.")
-            
             img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
             h_orig, w_orig = img.shape[:2]
             
