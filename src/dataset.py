@@ -182,21 +182,38 @@ class AmodalDataset(Dataset):
             
         elif self.mode.startswith("cocoa"):
             sample = self.samples[idx]
+            img_filename = sample['img_filename']
             
-            # 1. Tải ảnh gốc
-            img_path = os.path.join(self.coco_img_dir, sample['img_filename'])
+            # ==========================================
+            # 1. TẢI ẢNH GỐC VỚI ĐIỀU HƯỚNG THÔNG MINH
+            # ==========================================
+            # Dựa vào tên file (VD: COCO_val2014_000000192817.jpg) để tìm đúng thư mục con
+            if "train2014" in img_filename:
+                img_path = os.path.join(self.coco_img_dir, "train2014", img_filename)
+            elif "val2014" in img_filename:
+                img_path = os.path.join(self.coco_img_dir, "val2014", img_filename)
+            else:
+                # Fallback phòng hờ trường hợp bạn gom tất cả ảnh vào 1 thư mục phẳng
+                img_path = os.path.join(self.coco_img_dir, img_filename)
+                
             img = cv2.imread(img_path)
+            
             if img is None:
-                raise ValueError(f"Lỗi đọc ảnh COCO tại: {img_path}")
+                raise ValueError(f"🚨 OpenCV không tìm thấy ảnh COCO tại: {img_path}\n"
+                                 f"Hãy kiểm tra lại biến COCO_IMG_DIR xem đã trỏ đúng thư mục gốc chứa 'train2014' và 'val2014' chưa.")
             
             img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
             h_orig, w_orig = img.shape[:2]
             
-            # 2. Dựng Amodal Mask
+            # ==========================================
+            # 2. DỰNG AMODAL MASK
+            # ==========================================
             target_poly = sample['region']['segmentation']
             amodal_mask = self._poly_to_mask(target_poly, h_orig, w_orig)
             
-            # 3. Dựng Occluder Mask (Tìm chính xác kẻ che khuất qua trường 'order')
+            # ==========================================
+            # 3. DỰNG OCCLUDER MASK (Kẻ che khuất)
+            # ==========================================
             occluder_mask = np.zeros((h_orig, w_orig), dtype=np.uint8)
             all_regions = sample['all_regions']
             
@@ -208,11 +225,15 @@ class AmodalDataset(Dataset):
                         occluder_mask = np.logical_or(occluder_mask, occ_mask).astype(np.uint8)
                         break 
                         
-            # 4. Tính toán Modal Mask
+            # ==========================================
+            # 4. TÍNH TOÁN MODAL MASK
+            # ==========================================
             modal_mask = amodal_mask.copy()
             modal_mask[occluder_mask == 1] = 0
             
-            # 5. Tiền xử lý & Trả về Tensor
+            # ==========================================
+            # 5. TIỀN XỬ LÝ & TRẢ VỀ TENSOR
+            # ==========================================
             img = cv2.resize(img, self.image_size, interpolation=cv2.INTER_LINEAR)
             m_v = cv2.resize(modal_mask, self.image_size, interpolation=cv2.INTER_NEAREST)
             m_a = cv2.resize(amodal_mask, self.image_size, interpolation=cv2.INTER_NEAREST)
