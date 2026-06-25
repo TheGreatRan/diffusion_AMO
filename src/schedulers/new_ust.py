@@ -70,9 +70,15 @@ class OriginalUSTScheduler(BaseDAUSTScheduler):
 
 class ClampedDAUSTScheduler(BaseDAUSTScheduler):
     def _compute_p_keep(self, bar_beta_t, distance_map):
+        # 1. Chuẩn hóa khoảng cách về [0, 1] giống bản Exponential
         d_norm = distance_map / self.d_global
         d_norm = torch.clamp(d_norm, 0.0, 1.0)
+        
+        # 2. Re-tune lại sigma cho không gian [0, 1]
+        # sigma_norm = 0.1 tương đương với khoảng 36 pixel trên ảnh 256x256
         sigma_norm = 0.1 
+        
+        # 3. Tính suy giảm Gaussian mượt mà và áp dụng Clamping
         spatial_decay = torch.exp(-(d_norm ** 2) / (2 * (sigma_norm ** 2)))
         clamped_decay = torch.clamp(spatial_decay, min=self.beta_min)
         
