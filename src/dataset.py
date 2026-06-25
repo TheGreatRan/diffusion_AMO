@@ -56,11 +56,23 @@ class AmodalDataset(Dataset):
             if not self.coco_img_dir:
                 raise ValueError("LỖI: Chế độ COCOA yêu cầu phải truyền biến 'coco_img_dir'.")
             
-            # --- BỔ SUNG: CHỈ QUẾT Ổ CỨNG 2 LẦN ĐỂ LƯU DANH SÁCH FILE COCO 2017 VÀO RAM ---
+            # --- BỘ QUÉT 3 NGÃ: TRAIN, VAL VÀ TEST ---
             print("💾 Đang lập chỉ mục ảnh COCO 2017 để tăng tốc xử lý...")
             self.train2017_set = set(os.listdir(os.path.join(self.coco_img_dir, "train2017")))
             self.val2017_set = set(os.listdir(os.path.join(self.coco_img_dir, "val2017")))
             
+            # Bổ sung quét thêm thư mục test2017
+            test_dir = os.path.join(self.coco_img_dir, "test2017")
+            if os.path.exists(test_dir):
+                self.test2017_set = set(os.listdir(test_dir))
+            else:
+                self.test2017_set = set()
+            
+            # CHỐT CHẶN BẮT LỖI ĐƯỜNG DẪN RỖNG:
+            print(f"📊 Đã tìm thấy: {len(self.train2017_set)} ảnh Train, {len(self.val2017_set)} ảnh Val và {len(self.test2017_set)} ảnh Test.")
+            if len(self.train2017_set) == 0:
+                print("⚠️ CẢNH BÁO ĐỎ: Thư mục ảnh hoàn toàn trống rỗng! Hãy kiểm tra lại đường dẫn COCO_IMG_DIR.")
+
             with open(self.data_dir, 'r') as f:
                 cocoa_data = json.load(f)
             
@@ -178,21 +190,20 @@ class AmodalDataset(Dataset):
             
         elif self.mode.startswith("cocoa"):
             sample = self.samples[idx]
-            old_filename = sample['img_filename'] # Ví dụ: "COCO_val2014_000000192817.jpg"
+            old_filename = sample['img_filename'] 
             
-            # =========================================================
-            # BƯỚC 1 CHUYỂN ĐỔI: ÉP FORMAT TÊN FILE TỪ 2014 SANG chuẩn 2017
-            # =========================================================
-            # Lấy phần tử cuối sau dấu gạch dưới: "000000192817.jpg"
+            # ÉP FORMAT TÊN FILE TỪ 2014 SANG CHUẨN 2017
             coco2017_filename = old_filename.split('_')[-1] 
             
-            # Kiểm tra nhanh trên RAM xem file nằm ở thư mục train2017 hay val2017
+            # BỘ ĐỊNH TUYẾN 3 NGÃ THÔNG MINH
             if coco2017_filename in self.train2017_set:
                 img_path = os.path.join(self.coco_img_dir, "train2017", coco2017_filename)
             elif coco2017_filename in self.val2017_set:
                 img_path = os.path.join(self.coco_img_dir, "val2017", coco2017_filename)
+            elif coco2017_filename in self.test2017_set:
+                img_path = os.path.join(self.coco_img_dir, "test2017", coco2017_filename)
             else:
-                raise FileNotFoundError(f"🚨 Không tìm thấy ảnh {coco2017_filename} trong cả tập train2017 và val2017 của bộ COCO 2017!")
+                raise FileNotFoundError(f"🚨 Không tìm thấy ảnh {coco2017_filename} trong cả 3 tập train, val và test của COCO 2017!")
                 
             img = cv2.imread(img_path)
             img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
