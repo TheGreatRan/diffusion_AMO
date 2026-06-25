@@ -64,7 +64,7 @@ class BaseDAUSTScheduler:
 # CÁC CHIẾN LƯỢC TOÁN HỌC (ĐÃ LỌC BỎ CÁC BẢN LỖI)
 # ==========================================
 
-class OriginalUSTScheduler(BaseDAUSTScheduler):
+class BaselineUSTScheduler(BaseDAUSTScheduler):
     def _compute_p_keep(self, bar_beta_t, distance_map):
         return bar_beta_t.expand_as(distance_map)
 
