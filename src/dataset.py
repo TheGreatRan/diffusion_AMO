@@ -193,6 +193,9 @@ class AmodalDataset(Dataset):
             m_a = cv2.resize(amodal_mask, self.image_size, interpolation=cv2.INTER_NEAREST)
             
             img = img.astype(np.float32) / 255.0
+            mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+            std  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+            img = (img - mean) / std
             m_v = m_v.astype(np.float32)
             m_a = m_a.astype(np.float32)
             

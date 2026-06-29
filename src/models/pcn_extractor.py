@@ -39,6 +39,13 @@ class PCNExtractor(nn.Module):
         # Bật lại features_only=True để mạng tự động trích xuất [F1, F2, F3, F4] một cách chuẩn xác
         self.pvt = timm.create_model(model_name, pretrained=pretrained, features_only=True)
         
+        # Fix CL
+        self.pvt = timm.create_model(model_name, pretrained=pretrained, features_only=True)
+        # Lấy linh động số kênh của Stage 1 (ví dụ B2 là 32, B4 là 64)
+        stage1_channels = self.pvt.feature_info.channels()[0]  
+        self.zoe = ZOE(in_channels=1, embed_dim=stage1_channels, patch_size=4)
+        # Fix CL
+
         # ==========================================
         # KỸ THUẬT QUÉT ĐỘNG VÀ GẮN ỐNG TIÊM (HOOK)
         # ==========================================
