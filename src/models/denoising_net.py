@@ -151,3 +151,69 @@ class WeightedIoULoss(nn.Module):
         
         iou = (intersection + 1e-6) / (union + 1e-6)
         return (1.0 - iou).mean()
+    
+class BoundaryAwareEdgeLoss(nn.Module):
+    """
+    Edge Loss thiết kế riêng cho Amodal Segmentation.
+    
+    Điểm khác biệt so với Edge Loss thông thường:
+    - Dùng Laplacian thay vì Sobel: nhạy hơn với cả 4 hướng
+    - Spatial weighting: phạt nặng hơn ở vùng biên visible/occluded
+      (nơi mạng hay mắc lỗi nhất)
+    - Smooth L1 thay vì L2: robust hơn với annotation noise
+    """
+    def __init__(self, weight_boundary: float = 2.0):
+        """
+        Args:
+            weight_boundary: Hệ số phóng đại loss tại vùng biên visible/occluded.
+                             2.0 = phạt vùng biên gấp đôi vùng còn lại.
+        """
+        super().__init__()
+        self.weight_boundary = weight_boundary
+
+        # Laplacian kernel — detect edge theo cả 4 hướng
+        laplacian = torch.tensor(
+            [[0, 1, 0],
+             [1,-4, 1],
+             [0, 1, 0]], dtype=torch.float32
+        ).view(1, 1, 3, 3)
+        self.register_buffer('laplacian', laplacian)
+
+    def _extract_edges(self, mask: torch.Tensor) -> torch.Tensor:
+        """
+        Tính edge map từ binary mask bằng Laplacian.
+        Input:  (B, 1, H, W) — float, giá trị [0, 1]
+        Output: (B, 1, H, W) — edge magnitude, đã clamp về [0, 1]
+        """
+        edges = F.conv2d(mask, self.laplacian, padding=1)
+        return edges.abs().clamp(0, 1)
+
+    def forward(
+        self,
+        pred_logits: torch.Tensor,   # (B, 1, H, W) — raw logits từ DN
+        target_mask: torch.Tensor,   # (B, 1, H, W) — ground truth M_a, binary
+        modal_mask: torch.Tensor,    # (B, 1, H, W) — M_v, để tính spatial weight
+    ) -> torch.Tensor:
+
+        # 1. Soft prediction (differentiable)
+        pred_probs = torch.sigmoid(pred_logits)
+
+        # 2. Edge map của prediction và GT
+        pred_edges   = self._extract_edges(pred_probs)
+        target_edges = self._extract_edges(target_mask)
+
+        # 3. Spatial weight map:
+        #    - Vùng biên giữa visible và occluded (d(M_v) nhỏ): weight cao
+        #    - Vùng sâu trong occluded hoặc background: weight thấp hơn
+        #
+        #    Proxy: dùng chính target_edges của M_v làm boundary indicator
+        #    Pixel gần biên M_v → đây là nơi transition visible/occluded
+        modal_edges  = self._extract_edges(modal_mask)         # Edge của visible mask
+        # Dilate nhẹ để tạo vùng ảnh hưởng quanh biên
+        weight_map   = 1.0 + (self.weight_boundary - 1.0) * modal_edges
+
+        # 4. Smooth L1 loss trên edge maps, có spatial weight
+        edge_diff = F.smooth_l1_loss(pred_edges, target_edges, reduction='none')
+        weighted_loss = (edge_diff * weight_map).mean()
+
+        return weighted_loss

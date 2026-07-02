@@ -16,7 +16,7 @@ import matplotlib.pyplot as plt
 from src.dataset import AmodalDataset
 from src.utils.geometry import get_distance_map
 from src.models.pcn_extractor import PCNExtractor
-from src.models.denoising_net import DenoisingNetwork, WeightedBCELoss, WeightedIoULoss
+from src.models.denoising_net import DenoisingNetwork, WeightedBCELoss, WeightedIoULoss, BoundaryAwareEdgeLoss 
 
 # IMPORT CẢ 3 CHIẾN LƯỢC ĐỂ CHẠY ABLATION STUDY
 from src.schedulers.da_ust import BaselineUSTScheduler, ClampedDAUSTScheduler, ExponentialDAUSTScheduler
@@ -32,7 +32,7 @@ BATCH_SIZE = 16
 LEARNING_RATE = 1e-4
 IMAGE_SIZE = (256, 256)
 TIMESTEPS = 1000
-NUM_EPOCHS = 12        
+NUM_EPOCHS = 25        
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 SAVE_DIR = "/kaggle/working/checkpoints"
@@ -42,7 +42,7 @@ RESUME_TRAINING = True
 MAX_TRAIN_HOURS = 11.5        
 
 # Danh sách các chiến lược cần thử nghiệm
-STRATEGIES_TO_RUN = ["exponential"]
+STRATEGIES_TO_RUN = ["clamped"]
 
 # ==========================================
 # HÀM TRỢ GIÚP: VẼ BIỂU ĐỒ (RIÊNG & CHUNG)
@@ -128,19 +128,20 @@ def build_system(strategy_name):
     
     bce_criterion = WeightedBCELoss().to(DEVICE)
     iou_criterion = WeightedIoULoss().to(DEVICE)
-    
+    edge_criterion = edge_criterion = BoundaryAwareEdgeLoss(weight_boundary=2.0).to(DEVICE)
+
     optimizer = optim.AdamW([
         {'params': pcn.parameters(), 'lr': LEARNING_RATE * 0.1},
         {'params': dn.parameters(), 'lr': LEARNING_RATE}
     ], weight_decay=1e-2)
     lr_scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS)
     
-    return train_dataloader, val_dataloader, scheduler, pcn, dn, criterion, optimizer, lr_scheduler
+    return train_dataloader, val_dataloader, scheduler, pcn, dn, bce_criterion, iou_criterion, edge_criterion, optimizer, lr_scheduler
 
 # ==========================================
 # HÀM ĐÁNH GIÁ MÔ HÌNH (GIỮ NGUYÊN)
 # ==========================================
-def validate(val_dataloader, scheduler, pcn, dn, criterion):
+def validate(val_dataloader, scheduler, pcn, dn, bce_criterion, iou_criterion, edge_criterion):
     pcn.eval()
     dn.eval()
     val_loss = 0.0
@@ -157,7 +158,10 @@ def validate(val_dataloader, scheduler, pcn, dn, criterion):
             pyramid_features = pcn(I, M_v, x_t, t, use_hf=False)
             x_hat_0_logits = dn(x_t, t, pyramid_features)
             
-            loss = criterion(x_hat_0_logits, M_a)
+            loss_bce = bce_criterion(x_hat_0_logits, M_a)
+            loss_iou = iou_criterion(x_hat_0_logits, M_a)
+            loss_edge = edge_criterion(x_hat_0_logits, M_a, M_v)
+            loss = loss_bce + loss_iou + 0.5 * loss_edge
             val_loss += loss.item()
             
     return val_loss / len(val_dataloader)
@@ -166,7 +170,7 @@ def validate(val_dataloader, scheduler, pcn, dn, criterion):
 # MODULE HUẤN LUYỆN 1 CHIẾN LƯỢC ĐỘC LẬP
 # ==========================================
 def train_strategy(strategy_name, global_start_time, time_limit_seconds):
-    train_dataloader, val_dataloader, scheduler, pcn, dn, criterion, optimizer, lr_scheduler = build_system(strategy_name)
+    train_dataloader, val_dataloader, scheduler, pcn, dn, bce_criterion, iou_criterion, edge_criterion, optimizer, lr_scheduler = build_system(strategy_name)
     
     start_epoch = 0
     best_val_loss = float('inf')
@@ -224,7 +228,8 @@ def train_strategy(strategy_name, global_start_time, time_limit_seconds):
             
             loss_bce = bce_criterion(x_hat_0_logits, M_a)
             loss_iou = iou_criterion(x_hat_0_logits, M_a)
-            loss = loss_bce + loss_iou
+            loss_edge = edge_criterion(x_hat_0_logits, M_a, M_v)
+            loss = loss_bce + loss_iou + 0.5 * loss_edge
             
             loss.backward()
             torch.nn.utils.clip_grad_norm_(list(pcn.parameters()) + list(dn.parameters()), 1.0)
@@ -240,7 +245,7 @@ def train_strategy(strategy_name, global_start_time, time_limit_seconds):
             pbar.set_postfix({"Loss": f"{loss.item():.4f}"})
             
         avg_train_loss = train_loss / len(train_dataloader)
-        avg_val_loss = validate(val_dataloader, scheduler, pcn, dn, criterion)
+        avg_val_loss = validate(val_dataloader, scheduler, pcn, dn, bce_criterion, iou_criterion, edge_criterion)
         lr_scheduler.step()
         
         history['epoch_train_losses'].append(avg_train_loss)
@@ -276,9 +281,9 @@ def train_strategy(strategy_name, global_start_time, time_limit_seconds):
     return history
 
 EXTERNAL_CHECKPOINTS = {
-    "baseline": "/kaggle/input/models/ralphsitinh/cocoa-7epoch/pytorch/default/1/latest_ckpt_baseline.pth",
-    "clamped": "/kaggle/input/models/ralphsitinh/cocoa-7epoch/pytorch/default/1/latest_ckpt_clamped.pth",
-    "exponential": "/kaggle/input/models/ralphsitinh/cocoa-7epoch/pytorch/default/1/latest_ckpt_exponential.pth"
+    # "baseline": "/kaggle/input/models/ralphsitinh/cocoa-7epoch/pytorch/default/1/latest_ckpt_baseline.pth",
+    # "clamped": "/kaggle/input/models/ralphsitinh/cocoa-7epoch/pytorch/default/1/latest_ckpt_clamped.pth",
+    # "exponential": "/kaggle/input/models/ralphsitinh/cocoa-7epoch/pytorch/default/1/latest_ckpt_exponential.pth"
 }
 
 def restore_checkpoints_from_input():
