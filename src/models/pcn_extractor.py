@@ -36,8 +36,6 @@ class PCNExtractor(nn.Module):
         self.zoe = ZOE(in_channels=1, embed_dim=64, patch_size=4)
         
         print(f"Loading {model_name} from timm...")
-        # Bật lại features_only=True để mạng tự động trích xuất [F1, F2, F3, F4] một cách chuẩn xác
-        self.pvt = timm.create_model(model_name, pretrained=pretrained, features_only=True)
         
         # Fix CL
         self.pvt = timm.create_model(model_name, pretrained=pretrained, features_only=True)
