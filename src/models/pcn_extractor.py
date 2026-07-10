@@ -25,7 +25,7 @@ class TimeEmbedding(nn.Module):
         return emb
 
 class PCNExtractor(nn.Module):
-    def __init__(self, model_name='pvt_v2_b2', pretrained=True, embed_dim=768):
+    def __init__(self, model_name='pvt_v2_b4', pretrained=True, embed_dim=768):
         super().__init__()
         
         self.conv_c = nn.Sequential(
@@ -127,7 +127,7 @@ if __name__ == "__main__":
     print("🚀 Khởi động Unit Test cho PCN Extractor (PVTv2)...")
     
     # Khởi tạo mô hình
-    model = PCNExtractor(model_name='pvt_v2_b2', pretrained=False, embed_dim=768)
+    model = PCNExtractor(model_name='pvt_v2_b4', pretrained=False, embed_dim=768)
     
     # Giả lập Dữ liệu
     I = torch.rand(2, 3, 256, 256)
