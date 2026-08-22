@@ -6,7 +6,7 @@ import os
 import json
 
 class AmodalDataset(Dataset):
-    def __init__(self, data_dir, mode="toy", image_size=(256, 256), coco_img_dir=None):
+    def __init__(self, data_dir, mode="toy", image_size=(256, 256), coco_img_dir=None, augment=None):
         """
         Trái tim xử lý dữ liệu của dự án CondDiff-AMO.
         Đã tối ưu hóa cho cấu trúc thư mục ảnh phẳng giữ nguyên format tên file 2014.
@@ -16,12 +16,21 @@ class AmodalDataset(Dataset):
             mode (str): Chế độ chạy ("toy", "pix2gestalt", "cocoa_train", "cocoa_val", "cocoa_test").
             image_size (tuple): Kích thước chuẩn hóa đầu vào (H, W).
             coco_img_dir (str): Đường dẫn đến thư mục chứa TOÀN BỘ ảnh phẳng (Format: COCO_xxxx2014_xxxx.jpg).
+            augment (bool | None): Bật/tắt augmentation (hiện tại: random horizontal flip đồng bộ
+                trên I/M_v/M_a). None (mặc định) = tự động bật cho mode train ("pix2gestalt",
+                "cocoa_train"), tắt cho val/test/toy -- để chống overfitting trên các tập train nhỏ
+                (đặc biệt COCOA) mà không làm rò rỉ augmentation vào lúc đánh giá.
         """
         self.data_dir = data_dir
         self.mode = mode
         self.image_size = image_size 
         self.coco_img_dir = coco_img_dir
         self.samples = [] 
+
+        if augment is None:
+            self.augment = mode in ("pix2gestalt", "cocoa_train")
+        else:
+            self.augment = augment
         
         # ==========================================
         # CHẾ ĐỘ 1: TOY DATASET (Sinh dữ liệu giả lập)
@@ -128,6 +137,19 @@ class AmodalDataset(Dataset):
         cv2.fillPoly(mask, pts, 1)
         return mask
 
+    def _maybe_hflip(self, img, m_v, m_a):
+        """
+        Random horizontal flip ĐỒNG BỘ trên cả 3 (ảnh + 2 mask), xác suất 50%.
+        Gọi ngay sau resize, trước khi normalize/expand_dims -- lúc img vẫn là (H, W, 3)
+        và mask vẫn là (H, W), để np.flip(axis=1) lật đúng theo chiều ngang.
+        Chỉ áp dụng khi self.augment=True (mặc định bật cho pix2gestalt/cocoa_train).
+        """
+        if self.augment and np.random.rand() < 0.5:
+            img = np.ascontiguousarray(img[:, ::-1, ...])
+            m_v = np.ascontiguousarray(m_v[:, ::-1])
+            m_a = np.ascontiguousarray(m_a[:, ::-1])
+        return img, m_v, m_a
+
     def __getitem__(self, idx):
         if self.mode == "toy":
             return self._generate_toy_data()
@@ -146,7 +168,9 @@ class AmodalDataset(Dataset):
             img = cv2.resize(img, self.image_size, interpolation=cv2.INTER_LINEAR)
             m_v = cv2.resize(m_v, self.image_size, interpolation=cv2.INTER_NEAREST)
             m_a = cv2.resize(m_a, self.image_size, interpolation=cv2.INTER_NEAREST)
-            
+
+            img, m_v, m_a = self._maybe_hflip(img, m_v, m_a)
+
             img = img.astype(np.float32) / 255.0
             m_v = (m_v > 127).astype(np.float32)
             m_a = (m_a > 127).astype(np.float32)
@@ -191,7 +215,9 @@ class AmodalDataset(Dataset):
             img = cv2.resize(img, self.image_size, interpolation=cv2.INTER_LINEAR)
             m_v = cv2.resize(modal_mask, self.image_size, interpolation=cv2.INTER_NEAREST)
             m_a = cv2.resize(amodal_mask, self.image_size, interpolation=cv2.INTER_NEAREST)
-            
+
+            img, m_v, m_a = self._maybe_hflip(img, m_v, m_a)
+
             img = img.astype(np.float32) / 255.0
             mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
             std  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
