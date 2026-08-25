@@ -8,8 +8,6 @@ import json
 class AmodalDataset(Dataset):
     def __init__(self, data_dir, mode="toy", image_size=(256, 256), coco_img_dir=None, augment=None):
         """
-        Trái tim xử lý dữ liệu của dự án CondDiff-AMO.
-        Đã tối ưu hóa cho cấu trúc thư mục ảnh phẳng giữ nguyên format tên file 2014.
         
         Args:
             data_dir (str): Đường dẫn đến file .json nhãn COCOA tương ứng (Train/Val/Test).
@@ -138,16 +136,123 @@ class AmodalDataset(Dataset):
         return mask
 
     def _maybe_hflip(self, img, m_v, m_a):
-        """
-        Random horizontal flip ĐỒNG BỘ trên cả 3 (ảnh + 2 mask), xác suất 50%.
-        Gọi ngay sau resize, trước khi normalize/expand_dims -- lúc img vẫn là (H, W, 3)
-        và mask vẫn là (H, W), để np.flip(axis=1) lật đúng theo chiều ngang.
-        Chỉ áp dụng khi self.augment=True (mặc định bật cho pix2gestalt/cocoa_train).
-        """
+        """Random horizontal flip đồng bộ, xác suất 50%. Xem docstring _augment_all()."""
         if self.augment and np.random.rand() < 0.5:
             img = np.ascontiguousarray(img[:, ::-1, ...])
             m_v = np.ascontiguousarray(m_v[:, ::-1])
             m_a = np.ascontiguousarray(m_a[:, ::-1])
+        return img, m_v, m_a
+
+    def _maybe_scale_crop(self, img, m_v, m_a):
+        """
+        Random crop một vùng con (85-100% diện tích gốc) rồi resize lại đúng self.image_size,
+        ĐỒNG BỘ trên cả 3 (dùng chung 1 crop box, img nội suy linear, mask nội suy nearest
+        để giữ mask nhị phân sạch, không sinh giá trị trung gian 0<x<1).
+        """
+        if not self.augment:
+            return img, m_v, m_a
+
+        H, W = img.shape[:2]
+        scale = np.random.uniform(0.85, 1.0)
+        new_h, new_w = int(round(H * scale)), int(round(W * scale))
+        if new_h >= H or new_w >= W or new_h <= 0 or new_w <= 0:
+            return img, m_v, m_a
+
+        top = np.random.randint(0, H - new_h + 1)
+        left = np.random.randint(0, W - new_w + 1)
+
+        img_c = img[top:top + new_h, left:left + new_w]
+        m_v_c = m_v[top:top + new_h, left:left + new_w]
+        m_a_c = m_a[top:top + new_h, left:left + new_w]
+
+        img = cv2.resize(img_c, (W, H), interpolation=cv2.INTER_LINEAR)
+        m_v = cv2.resize(m_v_c, (W, H), interpolation=cv2.INTER_NEAREST)
+        m_a = cv2.resize(m_a_c, (W, H), interpolation=cv2.INTER_NEAREST)
+        return img, m_v, m_a
+
+    def _maybe_color_jitter(self, img):
+        """
+        Jitter brightness/contrast nhẹ (±15%), CHỈ áp dụng lên ảnh RGB -- không đụng vào
+        mask (occlusion không phụ thuộc màu sắc/độ sáng). img: (H,W,3), giá trị 0-255.
+        """
+        if not self.augment:
+            return img
+        img = img.astype(np.float32)
+        brightness = np.random.uniform(0.85, 1.15)
+        contrast = np.random.uniform(0.85, 1.15)
+        mean_val = img.mean()
+        img = (img - mean_val) * contrast + mean_val
+        img = img * brightness
+        return np.clip(img, 0, 255)
+
+    def _maybe_rotate(self, img, m_v, m_a, max_angle=15):
+        """
+        Xoay ngẫu nhiên góc nhỏ (±max_angle độ) quanh tâm ảnh, ĐỒNG BỘ trên cả 3.
+        Dùng cv2.warpAffine, img nội suy linear (BORDER_REFLECT tránh viền đen nhân tạo),
+        mask nội suy nearest + BORDER_CONSTANT=0 (vùng trống ngoài mask sau khi xoay coi
+        như không thuộc mask, hợp lý về mặt occlusion).
+        """
+        if not self.augment or np.random.rand() < 0.5:
+            return img, m_v, m_a
+
+        H, W = img.shape[:2]
+        angle = np.random.uniform(-max_angle, max_angle)
+        M = cv2.getRotationMatrix2D((W / 2, H / 2), angle, 1.0)
+
+        img = cv2.warpAffine(img, M, (W, H), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
+        m_v = cv2.warpAffine(m_v, M, (W, H), flags=cv2.INTER_NEAREST,
+                              borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+        m_a = cv2.warpAffine(m_a, M, (W, H), flags=cv2.INTER_NEAREST,
+                              borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+        return img, m_v, m_a
+
+    def _maybe_synthetic_occlusion(self, m_v, m_a, prob=0.4, max_patches=2, patch_scale_range=(0.05, 0.25)):
+        """
+        Augmentation ĐẶC THÙ cho amodal segmentation (không có ở generic augmentation
+        pipelines): che thêm ngẫu nhiên 1-2 mảng hình chữ nhật TRONG vùng M_v (visible),
+        đặt về 0 -- trong khi M_a (ground truth amodal) GIỮ NGUYÊN KHÔNG ĐỔI.
+
+        Mục đích: buộc model, với đúng cùng ground truth M_a, phải học tái tạo từ NHIỀU
+        kiểu che khuất M_v khác nhau (nhân bản đa dạng occlusion pattern mà không cần
+        thêm ảnh mới) -- nhắm trực tiếp vào khả năng suy luận vùng bị che (mIoU_inv),
+        đúng nút thắt hiện tại thay vì chỉ tăng đa dạng ảnh/màu sắc chung chung.
+
+        CHỈ sửa m_v, không đụng đến m_a hay img (ảnh RGB vẫn hiển thị vật thể đầy đủ,
+        chỉ có "nhãn visible" bị che thêm -- hợp lý vì input model là (I, M_v), không
+        phải I đã bị crop vật lý).
+        """
+        if not self.augment or np.random.rand() > prob:
+            return m_v
+
+        H, W = m_v.shape
+        ys, xs = np.where(m_v > 0)
+        if len(ys) == 0:
+            return m_v
+
+        m_v = m_v.copy()
+        n_patches = np.random.randint(1, max_patches + 1)
+        for _ in range(n_patches):
+            idx = np.random.randint(len(ys))
+            cy, cx = int(ys[idx]), int(xs[idx])
+            patch_h = max(1, int(H * np.random.uniform(*patch_scale_range)))
+            patch_w = max(1, int(W * np.random.uniform(*patch_scale_range)))
+            y0, y1 = max(0, cy - patch_h // 2), min(H, cy + patch_h // 2)
+            x0, x1 = max(0, cx - patch_w // 2), min(W, cx + patch_w // 2)
+            m_v[y0:y1, x0:x1] = 0
+        return m_v
+
+    def _augment_all(self, img, m_v, m_a):
+        """
+        Gộp toàn bộ augmentation, gọi 1 lần duy nhất ngay sau resize, trước khi normalize.
+        Thứ tự: hflip -> scale/crop -> rotate (ảnh hưởng không gian, áp cho cả 3)
+        -> color jitter (chỉ ảnh) -> synthetic occlusion (chỉ M_v, KHÔNG đụng M_a).
+        Tự động no-op nếu self.augment=False (val/test).
+        """
+        img, m_v, m_a = self._maybe_hflip(img, m_v, m_a)
+        img, m_v, m_a = self._maybe_scale_crop(img, m_v, m_a)
+        img, m_v, m_a = self._maybe_rotate(img, m_v, m_a)
+        img = self._maybe_color_jitter(img)
+        m_v = self._maybe_synthetic_occlusion(m_v, m_a)
         return img, m_v, m_a
 
     def __getitem__(self, idx):
@@ -169,7 +274,7 @@ class AmodalDataset(Dataset):
             m_v = cv2.resize(m_v, self.image_size, interpolation=cv2.INTER_NEAREST)
             m_a = cv2.resize(m_a, self.image_size, interpolation=cv2.INTER_NEAREST)
 
-            img, m_v, m_a = self._maybe_hflip(img, m_v, m_a)
+            img, m_v, m_a = self._augment_all(img, m_v, m_a)
 
             img = img.astype(np.float32) / 255.0
             m_v = (m_v > 127).astype(np.float32)
@@ -216,7 +321,7 @@ class AmodalDataset(Dataset):
             m_v = cv2.resize(modal_mask, self.image_size, interpolation=cv2.INTER_NEAREST)
             m_a = cv2.resize(amodal_mask, self.image_size, interpolation=cv2.INTER_NEAREST)
 
-            img, m_v, m_a = self._maybe_hflip(img, m_v, m_a)
+            img, m_v, m_a = self._augment_all(img, m_v, m_a)
 
             img = img.astype(np.float32) / 255.0
             mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
