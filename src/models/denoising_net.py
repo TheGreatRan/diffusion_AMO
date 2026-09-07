@@ -84,18 +84,25 @@ class OcclusionAwareContextRefinement(nn.Module):
     Tinh chỉnh riêng tầng đặc trưng sâu nhất F4 (Fig. 3B, phần OCR trong paper).
 
     Gồm 3 nhánh chạy song song trên F4:
-      - Local Branch  : dilation nhỏ (1, 3)  -> bắt chi tiết biên (occlusion boundaries)
-      - Global Branch : dilation lớn (6, 12) -> bắt ngữ cảnh tầm xa (long-range dependencies)
+      - Local Branch  : dilation nhỏ (mặc định 1, 2)  -> bắt chi tiết biên (occlusion boundaries)
+      - Global Branch : dilation lớn hơn (mặc định 3, 4) -> bắt ngữ cảnh tầm xa (long-range)
       - Pooling Branch: global average pooling -> ngữ cảnh toàn cục (global scene semantics)
     Mỗi nhánh có Channel Attention riêng để nhấn mạnh kênh liên quan tới occlusion.
     Sau khi fuse 3 nhánh, thêm Pyramid Attention (multi-scale pooling 3x3/5x5/7x7,
     xem class PyramidAttention) để dynamically reweight vùng không gian nào quan
     trọng cho việc suy luận vùng bị che khuất, mô phỏng occlusion ở nhiều kích cỡ.
 
+    LƯU Ý QUAN TRỌNG VỀ DILATION: F4 thường chỉ (H,W)=(8,8) với ảnh 256x256 (stride 32).
+    Dilation rate PHẢI tỷ lệ với kích thước feature map thực tế -- dilation quá lớn so với
+    map (vd 6, 12 copy nguyên từ ASPP thiết kế cho map 32-64x64) khiến 2 tap biên của kernel
+    3x3 rơi hoàn toàn ra ngoài map (vào vùng padding=0) ở MỌI vị trí, khiến conv thoái hoá
+    gần như 1x1 (không còn "long-range dependency" như tên gọi). Mặc định mới (3,4) đảm bảo
+    tap biên (cách tâm 2*dilation = 6, 8 pixel) vẫn còn nằm trong map 8x8 ở phần lớn vị trí.
+
     Input : F4  (B, C, H, W)   — feature sâu nhất từ PVT (thường H=W=8 với ảnh 256x256)
     Output: F4' (B, C, H, W)   — cùng shape, đã được tinh chỉnh (residual connection)
     """
-    def __init__(self, channels):
+    def __init__(self, channels, local_dilations=(1, 2), global_dilations=(3, 4)):
         super().__init__()
         branch_ch = max(channels // 2, 32)
 
@@ -106,19 +113,21 @@ class OcclusionAwareContextRefinement(nn.Module):
                 nn.ReLU(inplace=True)
             )
 
-        # Local Branch: dilation rate 1 -> 3 (channels -> branch_ch -> branch_ch)
-        # fine-grained textures / occlusion boundaries
+        d_local_1, d_local_2 = local_dilations
+        d_global_1, d_global_2 = global_dilations
+
+        # Local Branch: fine-grained textures / occlusion boundaries
         self.local_branch = nn.Sequential(
-            conv_layer(channels, branch_ch, dilation=1),
-            conv_layer(branch_ch, branch_ch, dilation=3),
+            conv_layer(channels, branch_ch, dilation=d_local_1),
+            conv_layer(branch_ch, branch_ch, dilation=d_local_2),
             ChannelAttention(branch_ch)
         )
 
-        # Global Branch: dilation rate 6 -> 12 (channels -> branch_ch -> branch_ch)
-        # long-range dependencies
+        # Global Branch: long-range dependencies (dilation vừa đủ để KHÔNG rơi hết vào padding
+        # trên feature map nhỏ -- xem giải thích ở docstring phía trên)
         self.global_branch = nn.Sequential(
-            conv_layer(channels, branch_ch, dilation=6),
-            conv_layer(branch_ch, branch_ch, dilation=12),
+            conv_layer(channels, branch_ch, dilation=d_global_1),
+            conv_layer(branch_ch, branch_ch, dilation=d_global_2),
             ChannelAttention(branch_ch)
         )
 
