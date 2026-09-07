@@ -2,6 +2,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from src.models.pcn_extractor import TimeEmbedding
+
 # ==========================================
 # 0. MODULE: CHANNEL ATTENTION (dùng nội bộ trong OCR)
 # ==========================================
@@ -270,7 +272,23 @@ class DenoisingNetwork(nn.Module):
         self.dec2 = nn.ConvTranspose2d(128, 64, 4, stride=2, padding=1)   # Lên H
         self.final_conv = nn.Conv2d(64, 1, 3, padding=1)  # Trả về 1 kênh mask (x_hat_0)
 
-    def forward(self, x_t, t_emb, pcn_features):
+        # ==========================================
+        # FIX: TIMESTEP CONDITIONING CHO NHÁNH U-NET
+        # ==========================================
+        # Trước đây `t_emb` được nhận vào forward() nhưng KHÔNG hề được sử dụng ở đâu cả --
+        # nhánh U-Net xử lý trực tiếp x_t (enc1->enc2->enc3->bottleneck->dec1->dec2) hoàn
+        # toàn không biết đang ở timestep nào, ngoại trừ gián tiếp qua A1 (vốn đã mang thông
+        # tin t từ PCN). Đây là thiếu sót so với thiết kế diffusion U-Net chuẩn (thường tiêm
+        # timestep ở MỌI tầng, không chỉ 1 điểm). Thêm time embedding + projection riêng cho
+        # từng tầng, tái dùng đúng TimeEmbedding đã có trong pcn_extractor.py để nhất quán.
+        self.time_embed = TimeEmbedding(embed_dim=256)
+        unet_channels = {"enc1": 64, "enc2": 128, "enc3": 256, "bottleneck": 256, "dec1": 128, "dec2": 64}
+        self.time_projs = nn.ModuleDict({
+            name: nn.Sequential(nn.Linear(256, c), nn.SiLU())
+            for name, c in unet_channels.items()
+        })
+
+    def forward(self, x_t, t, pcn_features):
         """
         x_t: Mask nhiễu (B, 1, H, W)
         t_emb: Timestep embedding (không gian tùy chỉnh nếu cần)
@@ -293,17 +311,24 @@ class DenoisingNetwork(nn.Module):
         # 3. Adaptive Feature Gate
         A1 = self.afg_module(A2, F_up1)  # Shape: (B, 256, H/4, W/4)
 
-        # 4. Lightweight U-Net
-        e1 = F.relu(self.enc1(x_t))
-        e2 = F.relu(self.enc2(e1))
-        e3 = F.relu(self.enc3(e2))  # Shape: (B, 256, H/4, W/4)
+        # 4. Time embedding dùng chung cho toàn bộ nhánh U-Net (FIX: trước đây không dùng)
+        t_emb = self.time_embed(t)  # (B, 256)
+
+        def inject_t(feat, name):
+            scale = self.time_projs[name](t_emb).unsqueeze(-1).unsqueeze(-1)  # (B, C, 1, 1)
+            return feat + scale
+
+        # 5. Lightweight U-Net, tiêm timestep ở MỌI tầng
+        e1 = F.relu(inject_t(self.enc1(x_t), "enc1"))
+        e2 = F.relu(inject_t(self.enc2(e1), "enc2"))
+        e3 = F.relu(inject_t(self.enc3(e2), "enc3"))  # Shape: (B, 256, H/4, W/4)
 
         # Conditioning: Ghép A1 vào cổ chai (Bottleneck)
         bottleneck_input = torch.cat([e3, A1], dim=1)  # Shape: (B, 512, H/4, W/4)
-        b = F.relu(self.bottleneck(bottleneck_input))
+        b = F.relu(inject_t(self.bottleneck(bottleneck_input), "bottleneck"))
 
-        d1 = F.relu(self.dec1(b))
-        d2 = F.relu(self.dec2(d1))
+        d1 = F.relu(inject_t(self.dec1(b), "dec1"))
+        d2 = F.relu(inject_t(self.dec2(d1), "dec2"))
         x_hat_0 = self.final_conv(d2)  # Shape: (B, 1, H, W) (Chưa qua Sigmoid để tính BCE Loss bằng Logits)
 
         return x_hat_0
