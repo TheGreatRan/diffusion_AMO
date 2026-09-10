@@ -24,25 +24,79 @@ class TimeEmbedding(nn.Module):
         emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=1)
         return emb
 
-class PCNExtractor(nn.Module):
-    def __init__(self, model_name='pvt_v2_b4', pretrained=True, embed_dim=768):
+
+class TimeTokenConcatenation(nn.Module):
+    """
+    Đúng tinh thần "Time Token Concatenation" (Sun et al. 2025, được paper CondDiff-AMO
+    trích dẫn ở Fig. 4): GHÉP (concatenate) time token vào chuỗi patch token, cho TOÀN BỘ
+    (patch + time) cùng đi qua 1 lớp self-attention.
+
+    SỬA LỖI QUAN TRỌNG (phát hiện bởi review, đã tự kiểm chứng bằng số trước khi sửa):
+    bản trước dùng CROSS-ATTENTION với Key/Value là DUY NHẤT 1 time token. Về mặt toán học,
+    softmax trên đúng 1 phần tử LUÔN LUÔN = 1.0 bất kể nội dung Query -- nghĩa là mọi patch
+    nhận về CHÍNH XÁC cùng 1 giá trị, không hề "khác nhau tuỳ patch" như tên gọi/comment cũ
+    ngụ ý. Đã verify: out(patch_A) == out(patch_B) tuyệt đối (chênh lệch = 0.0000000000) dù
+    patch_A, patch_B khác nhau hoàn toàn. Bản cross-attention cũ về bản chất tương đương
+    cơ chế cộng bias cũ (broadcast-add), chỉ là qua 1 phép biến đổi phi tuyến phức tạp hơn.
+
+    Bản sửa này GHÉP THẬT: chuỗi self-attention có (N+1) token (N patch + 1 time), nên
+    softmax có nhiều hơn 1 lựa chọn -> patch có thể thực sự nhận trọng số khác nhau tuỳ nội
+    dung của chính nó và của các patch khác (patch-to-patch interaction cũng được time token
+    "điều tiết" gián tiếp qua chung 1 phép self-attention).
+
+    CHI PHÍ: self-attention đầy đủ có độ phức tạp O((N+1)^2). CHỈ áp dụng module này ở các
+    stage có N nhỏ (khuyến nghị: F3 N=256, F4 N=64 với ảnh 256x256) -- ở stage 1/2
+    (N=4096/1024), chi phí quá lớn, nên PCNExtractor vẫn dùng broadcast-add (time_projs)
+    cho các stage đó dù use_time_token_concat=True (xem forward() của PCNExtractor).
+    """
+    def __init__(self, channels, num_heads=4):
         super().__init__()
+        # num_heads phải chia hết channels; nếu không, lùi về giá trị chia hết gần nhất
+        while channels % num_heads != 0 and num_heads > 1:
+            num_heads -= 1
+        self.time_token_proj = nn.Sequential(nn.Linear(256, channels), nn.SiLU())
+        self.self_attn = nn.MultiheadAttention(embed_dim=channels, num_heads=num_heads, batch_first=True)
+        self.norm = nn.LayerNorm(channels)
+
+    def forward(self, F_i: torch.Tensor, t_emb: torch.Tensor) -> torch.Tensor:
+        """
+        F_i   : (B, C, H, W) -- đặc trưng của 1 stage PVT (CHỈ dùng cho stage có N nhỏ)
+        t_emb : (B, 256)     -- time embedding dùng chung (từ TimeEmbedding)
+        """
+        B, C, H, W = F_i.shape
+        tokens = F_i.flatten(2).transpose(1, 2)                 # (B, N, C), N = H*W
+        time_token = self.time_token_proj(t_emb).unsqueeze(1)   # (B, 1, C)
+
+        seq = torch.cat([time_token, tokens], dim=1)   # (B, N+1, C) -- GHÉP THẬT SỰ
+        seq_norm = self.norm(seq)
+        # Self-attention trên TOÀN CHUỖI (patch+time cùng tương tác), không phải cross-attn
+        # suy biến với 1 K/V như bản cũ -- (N+1) key/value nên softmax không còn trivial.
+        attn_out, _ = self.self_attn(seq_norm, seq_norm, seq_norm)
+        seq = seq + attn_out  # residual
+
+        tokens_out = seq[:, 1:, :]  # bỏ time token, giữ lại đúng N patch token
+        F_i_out = tokens_out.transpose(1, 2).reshape(B, C, H, W)
+        return F_i_out
+
+class PCNExtractor(nn.Module):
+    def __init__(self, model_name='pvt_v2_b4', pretrained=True, embed_dim=768, use_time_token_concat=False):
+        super().__init__()
+        self.use_time_token_concat = use_time_token_concat
         
         self.conv_c = nn.Sequential(
             nn.Conv2d(in_channels=4, out_channels=3, kernel_size=3, padding=1),
             nn.SiLU(),
             nn.BatchNorm2d(3)
         )
-        self.zoe = ZOE(in_channels=1, embed_dim=64, patch_size=4)
-        
+
         print(f"Loading {model_name} from timm...")
-        
-        # Fix CL
+
         self.pvt = timm.create_model(model_name, pretrained=pretrained, features_only=True)
         # Lấy linh động số kênh của Stage 1 (ví dụ B2 là 32, B4 là 64)
-        stage1_channels = self.pvt.feature_info.channels()[0]  
+        stage1_channels = self.pvt.feature_info.channels()[0]
+        # FIX: trước đây self.zoe bị khởi tạo 2 lần (1 lần với embed_dim=64 cứng, bị ghi đè
+        # ngay bởi lần thứ 2 với stage1_channels động) -- thừa, dọn lại chỉ còn 1 lần đúng.
         self.zoe = ZOE(in_channels=1, embed_dim=stage1_channels, patch_size=4)
-        # Fix CL
 
         # ==========================================
         # KỸ THUẬT QUÉT ĐỘNG VÀ GẮN ỐNG TIÊM (HOOK)
@@ -63,10 +117,23 @@ class PCNExtractor(nn.Module):
         
         self.feature_channels = self.pvt.feature_info.channels()
         self.time_embed = TimeEmbedding(embed_dim=256)
+
+        # Cơ chế CŨ: broadcast-add bias theo kênh (nhanh, rẻ) -- LUÔN tạo đủ cho cả 4 tầng,
+        # vì tầng 1,2 (N=4096/1024 với ảnh 256x256) vẫn dùng cơ chế này ngay cả khi
+        # use_time_token_concat=True, do self-attention đầy đủ ở đó quá tốn kém (O(N^2)).
         self.time_projs = nn.ModuleList([
             nn.Sequential(nn.Linear(256, c), nn.SiLU()) for c in self.feature_channels
         ])
-        
+        # Cơ chế MỚI (Time Token Concatenation thật sự, xem class ở trên): CHỈ áp dụng cho
+        # 2 tầng sâu nhất (index 2, 3 -- tương ứng N=256, 64 token với ảnh 256x256), nơi
+        # self-attention đầy đủ O((N+1)^2) vẫn rẻ. Tầng 1, 2 vẫn dùng time_projs phía trên.
+        if self.use_time_token_concat:
+            self.TTC_STAGE_INDICES = [2, 3]  # chỉ số các tầng dùng cơ chế mới (0-indexed)
+            self.time_token_layers = nn.ModuleDict({
+                str(i): TimeTokenConcatenation(channels=self.feature_channels[i])
+                for i in self.TTC_STAGE_INDICES
+            })
+
         self.hf_proj = nn.Conv2d(self.feature_channels[-1], embed_dim, kernel_size=1)
         
         # Biến trạng thái lưu trữ nhiễu tạm thời cho mỗi batch
@@ -105,12 +172,19 @@ class PCNExtractor(nn.Module):
         # features_only=True sẽ tự động nhả ra mảng [F1, F2, F3, F4] chuẩn xịn
         features = self.pvt(X_input)
         
-        # 3. Nhúng Token Thời gian (Broadcast Cộng)
+        # 3. Nhúng Token Thời gian
         t_emb = self.time_embed(t)
         fused_features = []
-        for F, t_proj in zip(features, self.time_projs):
-            t_scale = t_proj(t_emb).unsqueeze(-1).unsqueeze(-1)
-            fused_features.append(F + t_scale)
+        for i, F in enumerate(features):
+            if self.use_time_token_concat and i in self.TTC_STAGE_INDICES:
+                # Cơ chế MỚI (chỉ tầng 3,4 -- N nhỏ, self-attention đầy đủ vẫn rẻ):
+                # ghép token thật (concatenation) + self-attention trên toàn chuỗi.
+                fused_features.append(self.time_token_layers[str(i)](F, t_emb))
+            else:
+                # Cơ chế CŨ (tầng 1,2 luôn dùng cái này; tầng 3,4 dùng khi
+                # use_time_token_concat=False): broadcast cộng bias cố định theo kênh.
+                t_scale = self.time_projs[i](t_emb).unsqueeze(-1).unsqueeze(-1)
+                fused_features.append(F + t_scale)
             
         # 4. Điều phối đầu ra cho hệ thống
         if use_hf:
