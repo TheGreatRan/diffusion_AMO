@@ -1,42 +1,37 @@
-import torch
-import torch.nn as nn
 import math
 import timm
+import torch
+import torch.nn as nn
+
 
 class ZOE(nn.Module):
     """
-    Zero Overlapping Embedding: tiêm x_t vào Stage 1 của PVT qua 1 conv không chồng lấn
-    (stride=kernel_size=patch_size).
-
-    FIX (điều tra biên độ, xem báo cáo trao đổi với GPT): nghi ngờ đóng góp của ZOE bị
-    "lấn át" khi cộng vào patch-embed đã PRETRAINED trên ImageNet -- vì nn.Conv2d khởi tạo
-    ngẫu nhiên (chưa từng train) có thể có biên độ hoạt động rất khác (thường nhỏ hơn nhiều)
-    so với patch-embed đã được calibrate qua hàng triệu bước train trên ImageNet. Nếu đúng,
-    đóng góp thực tế của x_t vào feature cuối cùng gần như biến mất dù về công thức là có.
-
-    Thêm InstanceNorm2d(affine=True) SAU conv: chuẩn hoá mỗi kênh (theo từng ảnh) về
-    zero-mean/unit-variance rồi mới áp affine (scale/bias) HỌC ĐƯỢC, khởi tạo mặc định
-    weight=1, bias=0. Nhờ vậy biên độ đầu ra của ZOE không còn phụ thuộc vào scale ngẫu
-    nhiên của trọng số conv lúc khởi tạo (vốn có thể quá nhỏ so với patch-embed pretrained),
-    mà được kiểm soát tường minh qua affine -- gradient descent có thể tự học tăng/giảm
-    đóng góp này trong lúc train, thay vì bị "khoá" ở một scale ngẫu nhiên ban đầu có thể
-    quá nhỏ để tạo ảnh hưởng thực sự.
+    Zero Overlapping Embedding: Tiêm x_t vào Stage 1 của PVT qua conv không chồng lấn.
+    
+    CẢI TIẾN:
+    1. Loại bỏ hoàn toàn InstanceNorm2d để bảo toàn thông tin mật độ che phủ toàn cục (mean) của mask x_t.
+    2. Sử dụng GroupNorm(1, embed_dim) (tương đương LayerNorm trên channel) kết hợp với
+       hệ số scale học được (self.gate) khởi tạo ở mức 0.1 (Zero/Small-Init paradigm).
+    Điều này giữ cho tín hiệu ZOE không làm sốc activation của PVTv2 ImageNet pretrained,
+    đồng thời cho phép gradient tự do khuếch đại hoặc thu nhỏ biên độ x_t trong quá trình huấn luyện.
     """
     def __init__(self, in_channels=1, embed_dim=64, patch_size=4):
         super().__init__()
         self.proj = nn.Conv2d(in_channels, embed_dim, kernel_size=patch_size, stride=patch_size, padding=0)
-        self.norm = nn.InstanceNorm2d(embed_dim, affine=True)
+        self.norm = nn.GroupNorm(1, embed_dim)
+        self.gate = nn.Parameter(torch.tensor(0.1, dtype=torch.float32))
 
     def forward(self, x_t):
-        x = self.proj(x_t)
-        x = self.norm(x)
-        return x
+        feat = self.proj(x_t)
+        feat = self.norm(feat)
+        return feat * self.gate
+
 
 class TimeEmbedding(nn.Module):
     def __init__(self, embed_dim):
         super().__init__()
         self.embed_dim = embed_dim
-    
+
     def forward(self, t):
         half_dim = self.embed_dim // 2
         emb = math.log(10000) / (half_dim - 1)
@@ -48,241 +43,160 @@ class TimeEmbedding(nn.Module):
 
 class TimeTokenConcatenation(nn.Module):
     """
-    Đúng tinh thần "Time Token Concatenation" (Sun et al. 2025, được paper CondDiff-AMO
-    trích dẫn ở Fig. 4): GHÉP (concatenate) time token vào chuỗi patch token, cho TOÀN BỘ
-    (patch + time) cùng đi qua 1 lớp self-attention.
-
-    SỬA LỖI QUAN TRỌNG (phát hiện bởi review, đã tự kiểm chứng bằng số trước khi sửa):
-    bản trước dùng CROSS-ATTENTION với Key/Value là DUY NHẤT 1 time token. Về mặt toán học,
-    softmax trên đúng 1 phần tử LUÔN LUÔN = 1.0 bất kể nội dung Query -- nghĩa là mọi patch
-    nhận về CHÍNH XÁC cùng 1 giá trị, không hề "khác nhau tuỳ patch" như tên gọi/comment cũ
-    ngụ ý. Đã verify: out(patch_A) == out(patch_B) tuyệt đối (chênh lệch = 0.0000000000) dù
-    patch_A, patch_B khác nhau hoàn toàn. Bản cross-attention cũ về bản chất tương đương
-    cơ chế cộng bias cũ (broadcast-add), chỉ là qua 1 phép biến đổi phi tuyến phức tạp hơn.
-
-    Bản sửa này GHÉP THẬT: chuỗi self-attention có (N+1) token (N patch + 1 time), nên
-    softmax có nhiều hơn 1 lựa chọn -> patch có thể thực sự nhận trọng số khác nhau tuỳ nội
-    dung của chính nó và của các patch khác (patch-to-patch interaction cũng được time token
-    "điều tiết" gián tiếp qua chung 1 phép self-attention).
-
-    NGUY CƠ NHIỄU BIẾN (phát hiện bởi review): module này đồng thời làm 2 việc -- (1) cho
-    patch biết t, VÀ (2) thêm 1 vòng self-attention phụ NGOÀI PVT giữa các patch với nhau
-    (PVT gốc đã tự làm việc này bên trong, đây là thêm 1 lớp mới). Nếu kết quả tốt hơn,
-    không biết quy cho (1) hay (2). Do đó thêm tham số `include_time_token`: đặt False để
-    tạo BIẾN THỂ ĐỐI CHỨNG (self-attention giữa các patch, KHÔNG có time token trong chuỗi)
-    -- dùng để tách bạch lợi ích thật của time-conditioning khỏi lợi ích của chỉ đơn thuần
-    có thêm 1 lớp self-attention.
-
-    CHI PHÍ: self-attention đầy đủ có độ phức tạp O((N+1)^2). CHỈ áp dụng module này ở các
-    stage có N nhỏ (khuyến nghị: F3 N=256, F4 N=64 với ảnh 256x256) -- ở stage 1/2
-    (N=4096/1024), chi phí quá lớn, nên PCNExtractor vẫn dùng broadcast-add (time_projs)
-    cho các stage đó dù use_time_token_concat=True (xem forward() của PCNExtractor).
+    Khối Time Token Concatenation chuẩn Transformer Block:
+    - Nhúng time token t_emb thành 1 token có độ dài 1 (B, 1, C).
+    - Ghép nối trực tiếp vào chuỗi patch tokens: [time_token, patch_tokens] có độ dài (N + 1).
+    - Cho toàn bộ chuỗi đi qua Pre-LayerNorm Self-Attention đầy đủ và FFN 2 tầng.
+    - Tách bỏ time token ở đầu ra, giữ lại N patch tokens đã được điều biến thời gian sâu.
     """
-    def __init__(self, channels, num_heads=4, include_time_token=True):
+    def __init__(self, channels, num_heads=4):
         super().__init__()
-        # num_heads phải chia hết channels; nếu không, lùi về giá trị chia hết gần nhất
         while channels % num_heads != 0 and num_heads > 1:
             num_heads -= 1
-        self.include_time_token = include_time_token
-        if self.include_time_token:
-            self.time_token_proj = nn.Sequential(nn.Linear(256, channels), nn.SiLU())
+
+        self.time_token_proj = nn.Sequential(
+            nn.Linear(256, channels),
+            nn.SiLU()
+        )
+        self.norm1 = nn.LayerNorm(channels)
         self.self_attn = nn.MultiheadAttention(embed_dim=channels, num_heads=num_heads, batch_first=True)
-        self.norm = nn.LayerNorm(channels)
-        # FFN đầy đủ (khắc phục điểm review mục 9: bản trước chỉ có attention+residual,
-        # thiếu FFN/second-residual của 1 Transformer block chuẩn).
+
         self.norm2 = nn.LayerNorm(channels)
         self.ffn = nn.Sequential(
-            nn.Linear(channels, channels * 2), nn.SiLU(), nn.Linear(channels * 2, channels)
+            nn.Linear(channels, channels * 2),
+            nn.SiLU(),
+            nn.Linear(channels * 2, channels)
         )
 
-    def forward(self, F_i: torch.Tensor, t_emb: torch.Tensor = None) -> torch.Tensor:
-        """
-        F_i   : (B, C, H, W) -- đặc trưng của 1 stage PVT (CHỈ dùng cho stage có N nhỏ)
-        t_emb : (B, 256)     -- time embedding dùng chung (từ TimeEmbedding). Bỏ qua nếu
-                                 include_time_token=False (biến thể đối chứng B).
-        """
+    def forward(self, F_i: torch.Tensor, t_emb: torch.Tensor) -> torch.Tensor:
         B, C, H, W = F_i.shape
-        tokens = F_i.flatten(2).transpose(1, 2)  # (B, N, C), N = H*W
+        tokens = F_i.flatten(2).transpose(1, 2)  # (B, N, C)
+        time_token = self.time_token_proj(t_emb).unsqueeze(1)  # (B, 1, C)
 
-        if self.include_time_token:
-            assert t_emb is not None, "include_time_token=True cần t_emb"
-            time_token = self.time_token_proj(t_emb).unsqueeze(1)  # (B, 1, C)
-            seq = torch.cat([time_token, tokens], dim=1)   # (B, N+1, C) -- GHÉP THẬT SỰ
-        else:
-            # BIẾN THỂ ĐỐI CHỨNG B: self-attention CHỈ giữa các patch, không có time token
-            seq = tokens  # (B, N, C)
+        seq = torch.cat([time_token, tokens], dim=1)  # (B, N + 1, C)
 
-        seq_norm = self.norm(seq)
-        # Self-attention trên TOÀN CHUỖI (patch [+time] cùng tương tác), không phải cross-attn
-        # suy biến với 1 K/V như bản cũ -- (N+1) key/value nên softmax không còn trivial.
+        # Self-Attention Branch với Residual
+        seq_norm = self.norm1(seq)
         attn_out, _ = self.self_attn(seq_norm, seq_norm, seq_norm)
-        seq = seq + attn_out  # residual 1
+        seq = seq + attn_out
 
-        # FFN + residual 2 (đúng cấu trúc 1 Transformer block chuẩn, không chỉ attention đơn)
+        # FFN Branch với Residual
         seq = seq + self.ffn(self.norm2(seq))
 
-        if self.include_time_token:
-            tokens_out = seq[:, 1:, :]  # bỏ time token, giữ lại đúng N patch token
-        else:
-            tokens_out = seq  # biến thể đối chứng B: không có time token để bỏ
-
+        tokens_out = seq[:, 1:, :]  # Loại bỏ time token, lấy lại N patch tokens
         F_i_out = tokens_out.transpose(1, 2).reshape(B, C, H, W)
         return F_i_out
 
+
 class PCNExtractor(nn.Module):
-    def __init__(self, model_name='pvt_v2_b4', pretrained=True, embed_dim=768,
-                 use_time_token_concat=False, include_time_token_in_ttc=True):
+    def __init__(self, model_name='pvt_v2_b4', pretrained=True, embed_dim=768, use_time_token_concat=True):
         """
-        use_time_token_concat=False              -> Mode A: broadcast-add (mặc định cũ)
-        use_time_token_concat=True,  include=True  -> Mode C: time token concat + self-attn (F3/F4)
-        use_time_token_concat=True,  include=False -> Mode B: self-attn ĐỐI CHỨNG, KHÔNG có
-                                                       time token (F3/F4) -- dùng để tách bạch
-                                                       lợi ích của time-conditioning khỏi lợi
-                                                       ích của chỉ đơn thuần thêm self-attention.
+        Args:
+            model_name (str): Tên backbone PVTv2 từ timm.
+            pretrained (bool): Sử dụng pretrained weights ImageNet.
+            embed_dim (int): Chiều kênh chiếu nếu dùng HF U-Net.
+            use_time_token_concat (bool): MẶC ĐỊNH LÀ TRUE. Kích hoạt ghép time token cho F3, F4.
         """
         super().__init__()
         self.use_time_token_concat = use_time_token_concat
-        self.include_time_token_in_ttc = include_time_token_in_ttc
-        
+
         self.conv_c = nn.Sequential(
             nn.Conv2d(in_channels=4, out_channels=3, kernel_size=3, padding=1),
             nn.SiLU(),
             nn.BatchNorm2d(3)
         )
 
-        print(f"Loading {model_name} from timm...")
-
+        print(f"Loading {model_name} from timm (pretrained={pretrained})...")
         self.pvt = timm.create_model(model_name, pretrained=pretrained, features_only=True)
-        # Lấy linh động số kênh của Stage 1 (ví dụ B2 là 32, B4 là 64)
-        stage1_channels = self.pvt.feature_info.channels()[0]
-        # FIX: trước đây self.zoe bị khởi tạo 2 lần (1 lần với embed_dim=64 cứng, bị ghi đè
-        # ngay bởi lần thứ 2 với stage1_channels động) -- thừa, dọn lại chỉ còn 1 lần đúng.
+        self.feature_channels = self.pvt.feature_info.channels()
+
+        stage1_channels = self.feature_channels[0]
         self.zoe = ZOE(in_channels=1, embed_dim=stage1_channels, patch_size=4)
 
-        # ==========================================
-        # KỸ THUẬT QUÉT ĐỘNG VÀ GẮN ỐNG TIÊM (HOOK)
-        # ==========================================
+        # Bắt lớp Patch Embedding đầu tiên để đăng ký forward hook
         embed_layer = None
-        # Quét qua toàn bộ các lớp con của PVTv2
         for module in self.pvt.modules():
-            # Bắt đúng bản chất Class thay vì dựa vào tên biến (variable name)
             if module.__class__.__name__ in ['OverlapPatchEmbed', 'PatchEmbed']:
                 embed_layer = module
-                break # Chỉ lấy lớp Patch Embed ĐẦU TIÊN (Tương ứng với Stage 1)
-                
+                break
+
         if embed_layer is not None:
-            # Gắn Hook: Mỗi khi lớp này chạy xong, tự động gọi hàm _zoe_injection_hook
             embed_layer.register_forward_hook(self._zoe_injection_hook)
         else:
             raise AttributeError("Không tìm thấy lớp Patch Embedding trong kiến trúc timm")
-        
-        self.feature_channels = self.pvt.feature_info.channels()
+
         self.time_embed = TimeEmbedding(embed_dim=256)
 
-        # Cơ chế CŨ: broadcast-add bias theo kênh (nhanh, rẻ) -- LUÔN tạo đủ cho cả 4 tầng,
-        # vì tầng 1,2 (N=4096/1024 với ảnh 256x256) vẫn dùng cơ chế này ngay cả khi
-        # use_time_token_concat=True, do self-attention đầy đủ ở đó quá tốn kém (O(N^2)).
+        # Broadcast-add bias dự phòng cho F1, F2 (hoặc toàn bộ nếu use_time_token_concat=False)
         self.time_projs = nn.ModuleList([
             nn.Sequential(nn.Linear(256, c), nn.SiLU()) for c in self.feature_channels
         ])
-        # Cơ chế MỚI (Time Token Concatenation thật sự, xem class ở trên): CHỈ áp dụng cho
-        # 2 tầng sâu nhất (index 2, 3 -- tương ứng N=256, 64 token với ảnh 256x256), nơi
-        # self-attention đầy đủ O((N+1)^2) vẫn rẻ. Tầng 1, 2 vẫn dùng time_projs phía trên.
+
+        # Cơ chế ghép token thật cho F3 (16x16=256 tokens) và F4 (8x8=64 tokens)
+        self.TTC_STAGE_INDICES = [2, 3]
         if self.use_time_token_concat:
-            self.TTC_STAGE_INDICES = [2, 3]  # chỉ số các tầng dùng cơ chế mới (0-indexed)
             self.time_token_layers = nn.ModuleDict({
-                str(i): TimeTokenConcatenation(
-                    channels=self.feature_channels[i],
-                    include_time_token=self.include_time_token_in_ttc,
-                )
+                str(i): TimeTokenConcatenation(channels=self.feature_channels[i])
                 for i in self.TTC_STAGE_INDICES
             })
 
         self.hf_proj = nn.Conv2d(self.feature_channels[-1], embed_dim, kernel_size=1)
-        
-        # Biến trạng thái lưu trữ nhiễu tạm thời cho mỗi batch
         self._current_zoe = None
 
     def _zoe_injection_hook(self, module, inputs, outputs):
-        """Hàm tự động bơm nhiễu x_t vào đầu ra của khối Patch Embed"""
-        # Xử lý linh hoạt việc timm có thể trả về Tensor hoặc Tuple(Tensor, H, W)
+        """Bơm đặc trưng ZOE(x_t) vào ngay sau patch embedding của Stage 1."""
         x = outputs[0] if isinstance(outputs, tuple) else outputs
-        
-        zoe_emb = self._current_zoe # Shape chuẩn: (B, C, H, W)
+        zoe_emb = self._current_zoe
         C = zoe_emb.shape[1]
-        
-        # Cộng nhiễu an toàn bất chấp định dạng shape mà timm đang dùng
+
         if x.dim() == 4:
-            if x.shape[1] == C:    # (B, C, H, W)
+            if x.shape[1] == C:
                 x = x + zoe_emb
-            elif x.shape[-1] == C: # (B, H, W, C)
+            elif x.shape[-1] == C:
                 x = x + zoe_emb.permute(0, 2, 3, 1)
-        elif x.dim() == 3:         # (B, N, C) - Dạng Token chuỗi
+        elif x.dim() == 3:
             x = x + zoe_emb.flatten(2).transpose(1, 2)
-            
+
         if isinstance(outputs, tuple):
             return (x, *outputs[1:])
-        else:
-            return x
+        return x
 
     def forward(self, I: torch.Tensor, M_v: torch.Tensor, x_t: torch.Tensor, t: torch.Tensor, use_hf: bool = False):
         X_input = self.conv_c(torch.cat([I, M_v], dim=1))
-        
-        # 1. Bơm "thuốc nhiễu" ZOE vào biến trạng thái
+
+        # 1. Trích xuất đặc trưng ZOE từ mask nhiễu x_t
         self._current_zoe = self.zoe(x_t)
-        
-        # 2. Chạy mạng PVTv2 như bình thường.
-        # Khi đi qua tầng Stage 1, Hook sẽ tự động tiêm ZOE vào.
-        # features_only=True sẽ tự động nhả ra mảng [F1, F2, F3, F4] chuẩn xịn
+
+        # 2. Chạy backbone PVT (hook sẽ tự động tiêm ZOE vào Stage 1)
         features = self.pvt(X_input)
-        
-        # 3. Nhúng Token Thời gian
+
+        # 3. Điều biến thời gian (Time Conditioning)
         t_emb = self.time_embed(t)
         fused_features = []
         for i, F in enumerate(features):
             if self.use_time_token_concat and i in self.TTC_STAGE_INDICES:
-                # Cơ chế MỚI (chỉ tầng 3,4 -- N nhỏ, self-attention đầy đủ vẫn rẻ):
-                # ghép token thật (concatenation) + self-attention trên toàn chuỗi.
                 fused_features.append(self.time_token_layers[str(i)](F, t_emb))
             else:
-                # Cơ chế CŨ (tầng 1,2 luôn dùng cái này; tầng 3,4 dùng khi
-                # use_time_token_concat=False): broadcast cộng bias cố định theo kênh.
                 t_scale = self.time_projs[i](t_emb).unsqueeze(-1).unsqueeze(-1)
                 fused_features.append(F + t_scale)
-            
-        # 4. Điều phối đầu ra cho hệ thống
+
         if use_hf:
             hf_features = self.hf_proj(fused_features[-1])
             B_hf, C_hf, H_hf, W_hf = hf_features.shape
-            return hf_features.view(B_hf, C_hf, -1).permute(0, 2, 1) # Tensor Token cho U-Net
+            return hf_features.view(B_hf, C_hf, -1).permute(0, 2, 1)
         else:
-            return fused_features # List 4 tầng cho Custom DN
+            return fused_features
 
-# ==========================================
-# KHỐI KIỂM THỬ ĐA ĐẦU RA (UNIT TEST ĐỘNG CƠ KÉP)
-# ==========================================
+
 if __name__ == "__main__":
-    print("🚀 Khởi động Unit Test cho PCN Extractor (PVTv2)...")
+    print("🚀 Kiểm thử PCNExtractor với ZOE cải tiến & TimeTokenConcatenation...")
+    pcn = PCNExtractor(model_name='pvt_v2_b4', pretrained=False, use_time_token_concat=True)
     
-    # Khởi tạo mô hình
-    model = PCNExtractor(model_name='pvt_v2_b4', pretrained=False, embed_dim=768)
-    
-    # Giả lập Dữ liệu
-    I = torch.rand(2, 3, 256, 256)
-    M_v = torch.rand(2, 1, 256, 256)
-    x_t = torch.rand(2, 1, 256, 256)
-    t = torch.tensor([10, 500])
-    
-    print("\n" + "="*50)
-    print("🧪 TEST 1: CHẾ ĐỘ CUSTOM DN (Tác giả gốc)")
-    print("="*50)
-    pyramid_feats = model(I, M_v, x_t, t, use_hf=False)
-    for i, f in enumerate(pyramid_feats):
-        print(f"✅ Khối F{i+1} shape: {f.shape}")
-        
-    print("\n" + "="*50)
-    print("🧪 TEST 2: CHẾ ĐỘ HUGGINGFACE U-NET")
-    print("="*50)
-    hf_tokens = model(I, M_v, x_t, t, use_hf=True)
-    print(f"✅ Tensor Token đầu ra: {hf_tokens.shape}")
-    print("="*50)
+    dummy_I = torch.randn(2, 3, 256, 256)
+    dummy_Mv = torch.randn(2, 1, 256, 256)
+    dummy_xt = torch.randn(2, 1, 256, 256)
+    dummy_t = torch.tensor([100, 500])
+
+    feats = pcn(dummy_I, dummy_Mv, dummy_xt, dummy_t)
+    for idx, f in enumerate(feats):
+        print(f"✅ Tầng F{idx+1} shape: {f.shape}")
