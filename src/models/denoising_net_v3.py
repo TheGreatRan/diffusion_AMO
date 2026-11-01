@@ -3,6 +3,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from src.models.pcn_extractor import TimeEmbedding
+from src.models.denoising_net import (
+    LocalEmphasis,
+    AdaptiveFeatureGate,
+    OcclusionAwareContextRefinement,
+)
 
 class TimeFiLMResBlock(nn.Module):
     """
