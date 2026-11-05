@@ -78,13 +78,161 @@ class ClampedDAUSTScheduler(BaseDAUSTScheduler):
         
         return bar_beta_t * clamped_decay
 
+# class ExponentialDAUSTScheduler(BaseDAUSTScheduler):
+#     def _compute_p_keep(self, bar_beta_t, distance_map):
+#         # FIXED: Chuẩn hóa theo hằng số toàn cục để đảm bảo Translation Invariance
+#         d_norm = distance_map / self.d_global
+#         d_norm = torch.clamp(d_norm, 0.0, 1.0)
+        
+#         g_d = 1.0 + self.gamma * (d_norm ** 2)
+        
+#         p_keep = torch.pow(bar_beta_t, g_d)
+#         return torch.clamp(p_keep, min=self.beta_min)
+
 class ExponentialDAUSTScheduler(BaseDAUSTScheduler):
-    def _compute_p_keep(self, bar_beta_t, distance_map):
-        # FIXED: Chuẩn hóa theo hằng số toàn cục để đảm bảo Translation Invariance
-        d_norm = distance_map / self.d_global
-        d_norm = torch.clamp(d_norm, 0.0, 1.0)
-        
-        g_d = 1.0 + self.gamma * (d_norm ** 2)
-        
-        p_keep = torch.pow(bar_beta_t, g_d)
-        return torch.clamp(p_keep, min=self.beta_min)
+    """
+    Spatially adaptive UST scheduler.
+
+    p_keep(p, t) =
+        beta_bar_t ** (1 + gamma * d_norm(p)^2)
+
+    where
+
+        d_norm(p) = clamp(distance_map(p) / scale, 0, 1)
+
+    `scale` must be computed from Mv only, so that the same
+    rule is available during training and inference.
+    """
+
+    def __init__(
+        self,
+        gamma: float = 5.0,
+        min_scale: float = 8.0,
+    ):
+        super().__init__()
+
+        if gamma < 0:
+            raise ValueError("gamma must be >= 0")
+
+        if min_scale <= 0:
+            raise ValueError("min_scale must be > 0")
+
+        self.gamma = float(gamma)
+        self.min_scale = float(min_scale)
+
+    def _compute_p_keep(
+        self,
+        bar_beta_t,
+        distance_map: torch.Tensor,
+        scale,
+    ) -> torch.Tensor:
+        """
+        Args:
+            bar_beta_t:
+                Scalar or tensor of shape (B,).
+
+            distance_map:
+                Shape (B,H,W) or (B,1,H,W).
+                Distance to the visible region.
+
+            scale:
+                Scalar or tensor of shape (B,).
+                Object-specific distance scale computed ONLY from Mv.
+
+        Returns:
+            p_keep:
+                Shape (B,1,H,W), or matching the normalized
+                distance-map representation.
+        """
+
+        if not torch.is_tensor(distance_map):
+            raise TypeError("distance_map must be a torch.Tensor")
+
+        # Always perform this computation in float32.
+        d = distance_map.float()
+
+        # Normalize shape to (B,1,H,W).
+        if d.dim() == 3:
+            d = d.unsqueeze(1)
+
+        elif d.dim() != 4:
+            raise ValueError(
+                "distance_map must have shape "
+                "(B,H,W) or (B,1,H,W)"
+            )
+
+        beta = torch.as_tensor(
+            bar_beta_t,
+            dtype=torch.float32,
+            device=d.device,
+        )
+
+        scale = torch.as_tensor(
+            scale,
+            dtype=torch.float32,
+            device=d.device,
+        )
+
+        # ---------------------------------------------------------
+        # Normalize beta -> (B,1,1,1)
+        # ---------------------------------------------------------
+
+        if beta.ndim == 0:
+            beta = beta.reshape(1, 1, 1, 1)
+
+        elif beta.ndim == 1:
+            beta = beta.reshape(-1, 1, 1, 1)
+
+        else:
+            raise ValueError(
+                "bar_beta_t must be a scalar or have shape (B,)"
+            )
+
+        # ---------------------------------------------------------
+        # Normalize scale -> (B,1,1,1)
+        # ---------------------------------------------------------
+
+        if scale.ndim == 0:
+            scale = scale.reshape(1, 1, 1, 1)
+
+        elif scale.ndim == 1:
+            scale = scale.reshape(-1, 1, 1, 1)
+
+        else:
+            raise ValueError(
+                "scale must be a scalar or have shape (B,)"
+            )
+
+        # ---------------------------------------------------------
+        # Clamp beta.
+        #
+        # No beta_min is introduced here.
+        # This preserves the terminal behavior of the schedule.
+        # ---------------------------------------------------------
+
+        beta = beta.clamp(0.0, 1.0)
+
+        # Prevent division by zero without Python-side branching.
+        safe_scale = scale.clamp(min=self.min_scale)
+
+        # ---------------------------------------------------------
+        # Spatial normalization
+        # ---------------------------------------------------------
+
+        d_norm = d / safe_scale
+        d_norm = d_norm.clamp(0.0, 1.0)
+
+        # ---------------------------------------------------------
+        # Distance-dependent exponent
+        # ---------------------------------------------------------
+
+        g = 1.0 + self.gamma * d_norm.square()
+
+        # ---------------------------------------------------------
+        # DA-UST
+        # ---------------------------------------------------------
+
+        p_keep = beta.pow(g)
+
+        # Numerical safety.
+        return p_keep.clamp(0.0, 1.0)
