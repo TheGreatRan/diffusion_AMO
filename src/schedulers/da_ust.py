@@ -2,237 +2,214 @@ import torch
 import math
 
 class BaseDAUSTScheduler:
-    def __init__(self, num_train_timesteps=1000, sigma=5.0, beta_min=0.05, gamma=5.0, image_size=256):
+    def __init__(self, num_train_timesteps=1000, sigma=5.0, beta_min=0.05,
+                 gamma=5.0, image_size=256):
         self.num_train_timesteps = num_train_timesteps
         self.sigma = sigma
         self.beta_min = beta_min
         self.gamma = gamma
         self.image_size = image_size
-        
-        # Hằng số chuẩn hóa toàn cục (Đường chéo ảnh)
         self.d_global = math.sqrt(image_size**2 + image_size**2)
-        
-        # ==========================================
-        # FIXED: COSINE SCHEDULE CHO ABSORBING STATE
-        # ==========================================
-        # Định nghĩa trực tiếp bar_beta_t (xác suất giữ lại) bằng đường cong Cosine
-        # Giúp mượt mà, chống sụp đổ ở các bước giữa (t=500 vẫn còn ~50% mask)
+
         steps = torch.arange(num_train_timesteps + 1, dtype=torch.float32) / num_train_timesteps
-        s = 0.008 # Tham số dịch chuyển nhẹ
+        s = 0.008
         alphas = torch.cos(((steps + s) / (1 + s)) * math.pi * 0.5) ** 2
-        
-        # ust_alphas_cumprod chính là bar_beta_t
-        self.ust_alphas_cumprod = alphas / alphas[0] 
-        # Cắt bỏ phần tử đầu tiên để mảng có đúng num_train_timesteps phần tử
-        self.ust_alphas_cumprod = self.ust_alphas_cumprod[1:]
+        self.ust_alphas_cumprod = (alphas / alphas[0])[1:]
 
-        # Lịch trình Gaussian (Vẫn giữ nguyên tuyến tính chuẩn của DDPM)
-        self.gaussian_betas = torch.linspace(0.0001, 0.02, num_train_timesteps)
-        self.gaussian_alphas_cumprod = torch.cumprod(1 - self.gaussian_betas, dim=0)
+        self.gaussian_betas = torch.linspace(
+            0.0001, 0.02, num_train_timesteps, dtype=torch.float32
+        )
+        self.gaussian_alphas_cumprod = torch.cumprod(
+            1.0 - self.gaussian_betas, dim=0
+        )
 
-    def _compute_p_keep(self, bar_beta_t: torch.Tensor, distance_map: torch.Tensor) -> torch.Tensor:
-        raise NotImplementedError("Bạn phải định nghĩa logic tính p_keep ở class con!")
+    def _compute_p_keep(self, bar_beta_t, distance_map, scale=None):
+        raise NotImplementedError
 
-    def add_noise(self, amodal_mask: torch.Tensor, distance_map: torch.Tensor, timesteps: torch.Tensor, return_intermediate=False):
+    @staticmethod
+    def _ensure_4d(x, name="tensor"):
+        if not torch.is_tensor(x):
+            raise TypeError(f"{name} must be a torch.Tensor")
+        if x.dim() == 3:
+            return x.unsqueeze(1)
+        if x.dim() == 4:
+            return x
+        raise ValueError(
+            f"{name} must have shape (B,H,W) or (B,1,H,W), got {tuple(x.shape)}"
+        )
+
+    @staticmethod
+    def _compute_visible_scale(visible_mask, min_scale=8.0):
+        mv = BaseDAUSTScheduler._ensure_4d(visible_mask, "visible_mask").float()
+        if mv.shape[1] != 1:
+            raise ValueError("visible_mask must have one channel.")
+        area = mv.sum(dim=(-2, -1))[:, 0]
+        return torch.sqrt(area).clamp(min=float(min_scale))
+
+    def add_noise(
+        self,
+        amodal_mask,
+        distance_map,
+        timesteps,
+        visible_mask=None,
+        scale=None,
+        return_intermediate=False,
+    ):
         device = amodal_mask.device
-        self.ust_alphas_cumprod = self.ust_alphas_cumprod.to(device)
-        self.gaussian_alphas_cumprod = self.gaussian_alphas_cumprod.to(device)
+        amodal_mask = self._ensure_4d(amodal_mask, "amodal_mask")
+        distance_map = self._ensure_4d(distance_map, "distance_map")
 
-        # Lấy ra bar_beta_t tương ứng với từng t trong batch
-        bar_beta_t = self.ust_alphas_cumprod[timesteps].view(-1, 1, 1, 1)
-        gauss_alpha_bar_t = self.gaussian_alphas_cumprod[timesteps].view(-1, 1, 1, 1)
+        if amodal_mask.shape != distance_map.shape:
+            raise ValueError(
+                f"amodal_mask and distance_map must match: "
+                f"{tuple(amodal_mask.shape)} vs {tuple(distance_map.shape)}"
+            )
 
-        # 1. TÍNH TOÁN XÁC SUẤT GIỮ LẠI
-        p_keep = self._compute_p_keep(bar_beta_t, distance_map)
-        
-        # 2. XÓI MÒN RỜI RẠC -> x'_t
+        timesteps = torch.as_tensor(timesteps, device=device, dtype=torch.long)
+        if timesteps.ndim == 0:
+            timesteps = timesteps.reshape(1)
+        if timesteps.ndim != 1 or timesteps.shape[0] != amodal_mask.shape[0]:
+            raise ValueError("timesteps must have shape (B,)")
+
+        ust_schedule = self.ust_alphas_cumprod.to(device)
+        gaussian_schedule = self.gaussian_alphas_cumprod.to(device)
+
+        bar_beta_t = ust_schedule[timesteps].view(-1, 1, 1, 1)
+        gauss_alpha_bar_t = gaussian_schedule[timesteps].view(-1, 1, 1, 1)
+
+        if scale is None and visible_mask is not None:
+            scale = self._compute_visible_scale(visible_mask, min_scale=8.0)
+
+        p_keep = self._compute_p_keep(bar_beta_t, distance_map, scale)
+
+        if p_keep.shape != amodal_mask.shape:
+            raise ValueError(
+                f"p_keep and amodal_mask must match: "
+                f"{tuple(p_keep.shape)} vs {tuple(amodal_mask.shape)}"
+            )
+
         rand_tensor = torch.rand_like(amodal_mask)
-        eroded_mask = (rand_tensor < p_keep).float()
-        
-        modal_mask = (distance_map == 0).float()
-        x_prime_t = torch.where(modal_mask == 1, amodal_mask, eroded_mask * amodal_mask)
+        eroded_mask = (rand_tensor < p_keep).to(amodal_mask.dtype)
 
-        # 3. THÊM NHIỄU GAUSSIAN LIÊN TỤC -> x_t
+        modal_mask = (distance_map == 0).to(amodal_mask.dtype)
+        x_prime_t = torch.where(
+            modal_mask == 1,
+            amodal_mask,
+            eroded_mask * amodal_mask
+        )
+
         epsilon = torch.randn_like(x_prime_t)
-        x_t = torch.sqrt(gauss_alpha_bar_t) * x_prime_t + torch.sqrt(1 - gauss_alpha_bar_t) * epsilon
+        x_t = (
+            torch.sqrt(gauss_alpha_bar_t) * x_prime_t
+            + torch.sqrt(1.0 - gauss_alpha_bar_t) * epsilon
+        )
 
         if return_intermediate:
             return x_t, x_prime_t
         return x_t
 
-# ==========================================
-# CÁC CHIẾN LƯỢC TOÁN HỌC (ĐÃ LỌC BỎ CÁC BẢN LỖI)
-# ==========================================
 
 class BaselineUSTScheduler(BaseDAUSTScheduler):
-    def _compute_p_keep(self, bar_beta_t, distance_map):
+    def _compute_p_keep(self, bar_beta_t, distance_map, scale=None):
         return bar_beta_t.expand_as(distance_map)
 
-class ClampedDAUSTScheduler(BaseDAUSTScheduler):
-    def _compute_p_keep(self, bar_beta_t, distance_map):
-        d_norm = distance_map / self.d_global
-        d_norm = torch.clamp(d_norm, 0.0, 1.0)
-        sigma_norm = 0.1 
-        spatial_decay = torch.exp(-(d_norm ** 2) / (2 * (sigma_norm ** 2)))
-        clamped_decay = torch.clamp(spatial_decay, min=self.beta_min)
-        
-        return bar_beta_t * clamped_decay
 
-# class ExponentialDAUSTScheduler(BaseDAUSTScheduler):
-#     def _compute_p_keep(self, bar_beta_t, distance_map):
-#         # FIXED: Chuẩn hóa theo hằng số toàn cục để đảm bảo Translation Invariance
-#         d_norm = distance_map / self.d_global
-#         d_norm = torch.clamp(d_norm, 0.0, 1.0)
-        
-#         g_d = 1.0 + self.gamma * (d_norm ** 2)
-        
-#         p_keep = torch.pow(bar_beta_t, g_d)
-#         return torch.clamp(p_keep, min=self.beta_min)
+class ClampedDAUSTScheduler(BaseDAUSTScheduler):
+    def _compute_p_keep(self, bar_beta_t, distance_map, scale=None):
+        d = distance_map.float()
+        d_norm = (d / self.d_global).clamp(0.0, 1.0)
+        sigma_norm = 0.1
+        spatial_decay = torch.exp(
+            -(d_norm ** 2) / (2.0 * sigma_norm ** 2)
+        )
+        clamped_decay = torch.clamp(spatial_decay, min=self.beta_min)
+        return (bar_beta_t * clamped_decay).clamp(0.0, 1.0)
+
 
 class ExponentialDAUSTScheduler(BaseDAUSTScheduler):
     """
-    Spatially adaptive UST scheduler.
+    p_keep(p,t) = bar_beta_t ** (1 + gamma * d_norm(p)^2)
 
-    p_keep(p, t) =
-        beta_bar_t ** (1 + gamma * d_norm(p)^2)
+    d_norm(p) = clamp(distance_map(p) / scale, 0, 1)
 
-    where
-
-        d_norm(p) = clamp(distance_map(p) / scale, 0, 1)
-
-    `scale` must be computed from Mv only, so that the same
-    rule is available during training and inference.
+    scale is computed only from M_v (default: sqrt(area(M_v))).
+    No positive beta_min is applied to p_keep.
     """
 
     def __init__(
         self,
-        gamma: float = 5.0,
-        min_scale: float = 8.0,
+        num_train_timesteps=1000,
+        sigma=5.0,
+        beta_min=0.05,
+        gamma=5.0,
+        image_size=256,
+        min_scale=8.0,
     ):
-        super().__init__()
-
+        super().__init__(
+            num_train_timesteps=num_train_timesteps,
+            sigma=sigma,
+            beta_min=beta_min,
+            gamma=gamma,
+            image_size=image_size,
+        )
         if gamma < 0:
             raise ValueError("gamma must be >= 0")
-
         if min_scale <= 0:
             raise ValueError("min_scale must be > 0")
-
         self.gamma = float(gamma)
         self.min_scale = float(min_scale)
 
-    def _compute_p_keep(
-        self,
-        bar_beta_t,
-        distance_map: torch.Tensor,
-        scale,
-    ) -> torch.Tensor:
-        """
-        Args:
-            bar_beta_t:
-                Scalar or tensor of shape (B,).
-
-            distance_map:
-                Shape (B,H,W) or (B,1,H,W).
-                Distance to the visible region.
-
-            scale:
-                Scalar or tensor of shape (B,).
-                Object-specific distance scale computed ONLY from Mv.
-
-        Returns:
-            p_keep:
-                Shape (B,1,H,W), or matching the normalized
-                distance-map representation.
-        """
-
+    def _compute_p_keep(self, bar_beta_t, distance_map, scale=None):
         if not torch.is_tensor(distance_map):
             raise TypeError("distance_map must be a torch.Tensor")
 
-        # Always perform this computation in float32.
         d = distance_map.float()
-
-        # Normalize shape to (B,1,H,W).
         if d.dim() == 3:
             d = d.unsqueeze(1)
-
         elif d.dim() != 4:
             raise ValueError(
-                "distance_map must have shape "
-                "(B,H,W) or (B,1,H,W)"
+                "distance_map must have shape (B,H,W) or (B,1,H,W)"
             )
 
         beta = torch.as_tensor(
-            bar_beta_t,
-            dtype=torch.float32,
-            device=d.device,
+            bar_beta_t, dtype=torch.float32, device=d.device
         )
-
-        scale = torch.as_tensor(
-            scale,
-            dtype=torch.float32,
-            device=d.device,
-        )
-
-        # ---------------------------------------------------------
-        # Normalize beta -> (B,1,1,1)
-        # ---------------------------------------------------------
-
         if beta.ndim == 0:
             beta = beta.reshape(1, 1, 1, 1)
-
         elif beta.ndim == 1:
             beta = beta.reshape(-1, 1, 1, 1)
-
-        else:
+        elif beta.ndim != 4:
             raise ValueError(
-                "bar_beta_t must be a scalar or have shape (B,)"
+                "bar_beta_t must be scalar, (B,), or (B,1,1,1)"
             )
-
-        # ---------------------------------------------------------
-        # Normalize scale -> (B,1,1,1)
-        # ---------------------------------------------------------
-
-        if scale.ndim == 0:
-            scale = scale.reshape(1, 1, 1, 1)
-
-        elif scale.ndim == 1:
-            scale = scale.reshape(-1, 1, 1, 1)
-
-        else:
-            raise ValueError(
-                "scale must be a scalar or have shape (B,)"
-            )
-
-        # ---------------------------------------------------------
-        # Clamp beta.
-        #
-        # No beta_min is introduced here.
-        # This preserves the terminal behavior of the schedule.
-        # ---------------------------------------------------------
-
         beta = beta.clamp(0.0, 1.0)
 
-        # Prevent division by zero without Python-side branching.
+        if scale is None:
+            raise ValueError(
+                "ExponentialDAUSTScheduler requires scale computed from M_v. "
+                "Pass visible_mask=... to add_noise(), or scale=... explicitly."
+            )
+
+        scale = torch.as_tensor(
+            scale, dtype=torch.float32, device=d.device
+        )
+        if scale.ndim == 0:
+            scale = scale.reshape(1, 1, 1, 1)
+        elif scale.ndim == 1:
+            scale = scale.reshape(-1, 1, 1, 1)
+        elif scale.ndim != 4:
+            raise ValueError(
+                "scale must be scalar, (B,), or (B,1,1,1)"
+            )
+
+        B = d.shape[0]
+        if beta.shape[0] not in (1, B):
+            raise ValueError("beta batch dimension does not match distance_map")
+        if scale.shape[0] not in (1, B):
+            raise ValueError("scale batch dimension does not match distance_map")
+
         safe_scale = scale.clamp(min=self.min_scale)
-
-        # ---------------------------------------------------------
-        # Spatial normalization
-        # ---------------------------------------------------------
-
-        d_norm = d / safe_scale
-        d_norm = d_norm.clamp(0.0, 1.0)
-
-        # ---------------------------------------------------------
-        # Distance-dependent exponent
-        # ---------------------------------------------------------
-
+        d_norm = (d / safe_scale).clamp(0.0, 1.0)
         g = 1.0 + self.gamma * d_norm.square()
 
-        # ---------------------------------------------------------
-        # DA-UST
-        # ---------------------------------------------------------
-
-        p_keep = beta.pow(g)
-
-        # Numerical safety.
-        return p_keep.clamp(0.0, 1.0)
+        return beta.pow(g).clamp(0.0, 1.0)
